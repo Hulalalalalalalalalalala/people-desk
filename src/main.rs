@@ -91,8 +91,10 @@ fn generate_key_file(path: &str) -> std::io::Result<()> {
     // O_CREAT | O_EXCL: fail if anything already exists at the path (file,
     // directory, or symlink -- including a dangling one, which O_NOFOLLOW
     // also rejects), so a pre-existing object is never overwritten or
-    // followed. mode 0600 makes the inode owner-only from the moment it is
-    // created; the umask can only strip bits, never add group/other access.
+    // followed. Requesting mode 0600 means group/other never gain access at
+    // creation: umask can only strip bits, never add them. A strict umask
+    // (e.g. 0777) can also strip the owner bits; write_key() restores the
+    // full mode with fchmod before any key byte is written.
     let fd = unsafe {
         libc::open(
             c_path.as_ptr(),
@@ -152,17 +154,37 @@ fn generate_key_file(path: &str) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn write_key(fd: RawFd, key: &[u8; KEY_LEN]) -> std::io::Result<()> {
-    // Verify owner-only permissions before any secret byte is written: on a
-    // filesystem that cannot honor mode 0600 (group/other bits set) we fail
-    // rather than leave a key readable by others.
+    // Ensure exactly 0600 (owner read/write, nothing for group/other)
+    // before any secret byte is written.
+    //
+    // The umask applied at open() may also have stripped the owner bits
+    // (e.g. umask 0777 yields mode 0000), and some filesystems fail to
+    // record the requested mode. fchmod on our fresh fd restores the full
+    // mode (it is not affected by umask and can never grant group/other
+    // access), then fstat confirms the on-disk mode is exactly 0600 --
+    // fchmod can appear to succeed on filesystems that silently ignore it
+    // (e.g. certain FAT mounts), so the result must be verified. If either
+    // step fails, no key byte is ever written and the caller removes the
+    // empty file.
+    if unsafe { libc::fchmod(fd, 0o600) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!("cannot set key file permissions to 0600: {e}"),
+        ));
+    }
+
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    if st.st_mode & 0o077 != 0 {
+    if st.st_mode & 0o7777 != 0o600 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "cannot restrict key file to owner-only (0600) permissions",
+            format!(
+                "key file permissions are {:04o}, cannot guarantee owner-only (0600) permissions",
+                st.st_mode & 0o7777
+            ),
         ));
     }
 
