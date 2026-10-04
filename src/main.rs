@@ -91,8 +91,11 @@ fn generate_key_file(path: &str) -> std::io::Result<()> {
     // O_CREAT | O_EXCL: fail if anything already exists at the path (file,
     // directory, or symlink -- including a dangling one, which O_NOFOLLOW
     // also rejects), so a pre-existing object is never overwritten or
-    // followed. mode 0600 makes the inode owner-only from the moment it is
-    // created; the umask can only strip bits, never add group/other access.
+    // followed. mode 0600 contains no group/other bits, and the umask can
+    // only strip bits, never add them: group/other therefore never gain
+    // access, not even for an instant. A strict umask (e.g. 0777) can also
+    // strip the owner bits, leaving 0000; that is repaired with fchmod and
+    // verified before any key byte is written (see ensure_owner_only_mode).
     let fd = unsafe {
         libc::open(
             c_path.as_ptr(),
@@ -114,10 +117,13 @@ fn generate_key_file(path: &str) -> std::io::Result<()> {
     }
     let fd = fd as RawFd;
 
-    let result = write_key(fd, &key);
+    // Enforce and confirm exactly 0600 before writing, then write and fsync.
+    // On any failure the inode we just created is unlinked below; an object
+    // predating this invocation is never touched.
+    let outcome = ensure_owner_only_mode(fd).and_then(|()| write_key(fd, &key));
     key.fill(0);
 
-    match result {
+    match outcome {
         Err(e) => {
             // Unlink while our fd is still open: only the link to the inode
             // we just created is removed, never an object that predates this
@@ -151,21 +157,50 @@ fn generate_key_file(path: &str) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn write_key(fd: RawFd, key: &[u8; KEY_LEN]) -> std::io::Result<()> {
-    // Verify owner-only permissions before any secret byte is written: on a
-    // filesystem that cannot honor mode 0600 (group/other bits set) we fail
-    // rather than leave a key readable by others.
+fn ensure_owner_only_mode(fd: RawFd) -> std::io::Result<()> {
+    // The mode passed to open() is masked by the process umask, so a strict
+    // umask (e.g. 0777) can strip the owner read/write bits, and some
+    // filesystems may adjust or refuse the requested mode. fchmod on the
+    // open fd is not affected by the umask: force exactly 0600 and then
+    // fstat to confirm the filesystem actually stores those bits. This
+    // runs before any key byte is written, so a file that cannot meet the
+    // requirement never receives secret data.
+    if unsafe { libc::fchmod(fd, 0o600) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!(
+                "cannot set key file permissions to 0600: {e} \
+                 (filesystem does not support the required permissions)"
+            ),
+        ));
+    }
+
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    if st.st_mode & 0o077 != 0 {
+
+    // Exactly owner read/write, no group or other permissions of any kind.
+    // This rejects 0400/0200/0000 (owner bits missing under a strict umask)
+    // as well as any mode carrying group/other bits.
+    if st.st_mode & 0o7777 != 0o600 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "cannot restrict key file to owner-only (0600) permissions",
+            format!(
+                "cannot guarantee key file permissions 0600: \
+                 filesystem reports mode 0{:04o}",
+                st.st_mode & 0o7777
+            ),
         ));
     }
+    Ok(())
+}
 
+#[cfg(unix)]
+fn write_key(fd: RawFd, key: &[u8; KEY_LEN]) -> std::io::Result<()> {
+    // Caller has already run ensure_owner_only_mode: the inode carries
+    // exactly 0600 before the first secret byte reaches it.
     write_all(fd, key)?;
 
     if unsafe { libc::fsync(fd) } != 0 {
