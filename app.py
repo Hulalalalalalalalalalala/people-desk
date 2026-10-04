@@ -49,6 +49,7 @@ a{color:#175b9c}
   <label>邮箱（选填）<input name="email"></label>
   <button type="submit">保存档案</button>
   <div id="form-error" class="msg error" hidden></div>
+  <div id="form-note" class="msg error" hidden></div>
 </form>
 <h2>员工列表</h2>
 <div id="list"><p class="empty">加载中……</p></div>
@@ -90,19 +91,46 @@ function render(employees){
   html+="</tbody></table>";
   root.innerHTML=html;
 }
+// 最后一次成功读取到的员工列表；null 表示还没有任何一次读取成功。
+var lastEmployees=null;
+function showLoadError(){
+  var root=document.getElementById("list");
+  if(lastEmployees&&lastEmployees.length){
+    // 已有成功展示过的员工：保留上次记录，并明确说明本次未能取得最新列表。
+    render(lastEmployees);
+    var note=document.createElement("p");
+    note.className="msg error";
+    note.textContent="员工列表加载失败，请稍后重试。当前显示的是上次读取的记录，本次未能取得最新列表。";
+    root.appendChild(note);
+  }else{
+    // 从未成功读取，或上次成功取得的就是空列表：只显示失败状态。
+    root.innerHTML='<p class="msg error">员工列表加载失败，请稍后重试。</p>';
+  }
+}
 function load(){
-  fetch("/api/employees")
-    .then(function(r){return r.json();})
-    .then(function(data){render(data.employees||[]);})
+  return fetch("/api/employees")
+    .then(function(r){
+      if(!r.ok){throw new Error("list status "+r.status);}
+      return r.json();
+    })
+    .then(function(data){
+      if(!data||!Array.isArray(data.employees)){throw new Error("list payload invalid");}
+      lastEmployees=data.employees;
+      render(lastEmployees);
+      return true;
+    })
     .catch(function(){
-      document.getElementById("list").innerHTML='<p class="empty">员工列表加载失败，请稍后重试。</p>';
+      showLoadError();
+      return false;
     });
 }
 document.getElementById("emp-form").addEventListener("submit",function(ev){
   ev.preventDefault();
   var form=ev.target;
   var errBox=document.getElementById("form-error");
+  var noteBox=document.getElementById("form-note");
   errBox.hidden=true;
+  noteBox.hidden=true;
   var body={
     employee_no:form.employee_no.value,
     name:form.name.value,
@@ -121,7 +149,13 @@ document.getElementById("emp-form").addEventListener("submit",function(ev){
   }).then(function(res){
     if(res.status===201){
       form.reset();
-      load();
+      load().then(function(ok){
+        if(!ok){
+          // 档案已保存成功，仅列表刷新失败：不能当作保存失败。
+          noteBox.textContent="档案已保存，但员工列表刷新失败，请稍后重试。";
+          noteBox.hidden=false;
+        }
+      });
     }else{
       errBox.textContent=(res.data&&res.data.error)||"保存失败，请检查填写内容。";
       errBox.hidden=false;
