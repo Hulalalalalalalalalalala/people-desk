@@ -205,7 +205,14 @@ fn ensure_owner_only_mode(fd: RawFd) -> std::io::Result<()> {
 
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return Err(std::io::Error::last_os_error());
+        // Without a fresh stat result the actual on-disk mode cannot be
+        // confirmed, so the requirement cannot be met -- say so explicitly
+        // rather than surface a bare errno string.
+        let e = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!("cannot verify key file permissions are 0600: {e}"),
+        ));
     }
 
     // Exactly owner read/write, no group or other permissions of any kind.
