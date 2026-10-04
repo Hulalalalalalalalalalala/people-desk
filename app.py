@@ -231,9 +231,12 @@ def main():
                 return
 
             for field in REQUIRED_FIELDS:
-                if field not in data or not isinstance(data[field], str):
-                    label = FIELD_LABELS[field]
-                    self.respond(400, {"error": f"{label}不能为空，且必须是字符串", "field": field})
+                label = FIELD_LABELS[field]
+                if field not in data:
+                    self.respond(400, {"error": f"{label}不能为空", "field": field})
+                    return
+                if not isinstance(data[field], str):
+                    self.respond(400, {"error": f"{label}必须是字符串", "field": field})
                     return
 
             employee_no = data["employee_no"].strip()
