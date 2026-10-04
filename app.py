@@ -33,6 +33,8 @@ th{background:#f4f4f4}
 .msg{margin:.75rem 0 0;padding:.5rem .75rem;border-radius:.3rem}
 .error{background:#fdecea;color:#9b1c1c;border:1px solid #f5c2c0}
 .empty{color:#666}
+#list .error{margin-top:1rem}
+.list-note{margin:.6rem 0 0;color:#9b1c1c;font-size:.95rem}
 a{color:#175b9c}
 </style>
 <main>
@@ -70,12 +72,7 @@ function contact(e){
   if(e.email){parts.push(e.email);}
   return parts.length?parts.join(" · "):"未填写";
 }
-function render(employees){
-  var root=document.getElementById("list");
-  if(!employees.length){
-    root.innerHTML='<p class="empty">还没有员工记录。</p>';
-    return;
-  }
+function tableHtml(employees){
   var html="<table><thead><tr><th>工号</th><th>姓名</th><th>部门</th><th>岗位</th><th>状态</th><th>生效日期</th><th>联系方式</th></tr></thead><tbody>";
   for(var i=0;i<employees.length;i++){
     var e=employees[i];
@@ -88,15 +85,60 @@ function render(employees){
       +"<td>"+esc(contact(e))+"</td></tr>";
   }
   html+="</tbody></table>";
+  return html;
+}
+function render(employees){
+  var root=document.getElementById("list");
+  if(!employees.length){
+    root.innerHTML='<p class="empty">还没有员工记录。</p>';
+    return;
+  }
+  root.innerHTML=tableHtml(employees);
+}
+// 上次成功读取到的员工列表：
+//   null  —— 从未成功取得过列表（不能得出“没有员工”的结论）；
+//   []    —— 上次成功取得的就是空列表；
+//   非空  —— 上次成功取得的员工行，后续读取失败时继续展示并标注为旧记录。
+var lastEmployees=null;
+function showLoadError(afterSave){
+  var root=document.getElementById("list");
+  var lead=afterSave
+    ?"档案已保存，但员工列表刷新失败。"
+    :"员工列表加载失败，请稍后重试。";
+  if(lastEmployees===null){
+    // 从未成功取得过列表：只能提示失败，不能显示“还没有员工记录”。
+    root.innerHTML='<p class="msg error">'+esc(lead)+'</p>';
+    return;
+  }
+  // 曾成功取得过列表：保留上次的员工行与内容，并明确这是上次读取的
+  // 记录、本次未能取得最新列表。上次为空列表时同样进入失败状态，
+  // 不再把空列表提示当作本次查询结果。
+  var html='<p class="list-note">'+esc(lead)
+    +"当前显示的是上次读取的记录，本次未能取得最新列表。</p>";
+  if(lastEmployees.length){
+    html+=tableHtml(lastEmployees);
+  }
   root.innerHTML=html;
 }
-function load(){
-  fetch("/api/employees")
-    .then(function(r){return r.json();})
-    .then(function(data){render(data.employees||[]);})
-    .catch(function(){
-      document.getElementById("list").innerHTML='<p class="empty">员工列表加载失败，请稍后重试。</p>';
-    });
+function loadList(afterSave){
+  fetch("/api/employees").then(function(r){
+    // 错误状态（即使正文是可解析的 JSON）一律视为读取失败。
+    if(!r.ok){
+      throw new Error("员工列表响应状态异常");
+    }
+    return r.json();
+  }).then(function(data){
+    // 成功响应必须带有数组形式的 employees，否则按读取失败处理，
+    // 绝不用空数组顶替。
+    if(!data||!Array.isArray(data.employees)){
+      throw new Error("员工列表响应缺少 employees 数组");
+    }
+    lastEmployees=data.employees;
+    render(data.employees);
+  }).catch(function(){
+    // 网络中断、正文无法解析等失败同样走到这里。
+    showLoadError(afterSave);
+  });
 }
 document.getElementById("emp-form").addEventListener("submit",function(ev){
   ev.preventDefault();
@@ -120,9 +162,15 @@ document.getElementById("emp-form").addEventListener("submit",function(ev){
     return r.json().then(function(data){return {status:r.status,data:data};});
   }).then(function(res){
     if(res.status===201){
+      // 建档已成功：表单按既有行为清空；后续列表读取若失败，由列表
+      // 区域说明“档案已保存，但员工列表刷新失败”，不变成保存失败，
+      // 也不要求用户再次提交。新员工只在列表成功读取后才展示。
       form.reset();
-      load();
+      errBox.hidden=true;
+      loadList(true);
     }else{
+      // 建档本身失败（工号重复、字段无效等）：保留填写内容并显示
+      // 原有原因；员工列表区域的提示不会遮掉这里的信息。
       errBox.textContent=(res.data&&res.data.error)||"保存失败，请检查填写内容。";
       errBox.hidden=false;
     }
@@ -131,7 +179,7 @@ document.getElementById("emp-form").addEventListener("submit",function(ev){
     errBox.hidden=false;
   });
 });
-load();
+loadList(false);
 </script>
 </html>
 """
