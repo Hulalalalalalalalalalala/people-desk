@@ -1,8 +1,11 @@
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::process::ExitCode;
 
 #[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 
@@ -10,14 +13,17 @@ const VERSION_STRING: &str = "wrapfile 0.1.0";
 const KEY_LEN: usize = 32;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    // args_os (not args): on Unix a key file path may contain bytes that are
+    // not valid UTF-8, and those are legitimate on-disk names we must accept
+    // verbatim rather than panic on.
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
 
-    match args.first().map(|s| s.as_str()) {
-        Some("--version") if args.len() == 1 => {
+    match args.first().map(OsString::as_os_str) {
+        Some(a) if a == "--version" && args.len() == 1 => {
             println!("{VERSION_STRING}");
             ExitCode::SUCCESS
         }
-        Some("keygen") => run_keygen(&args[1..]),
+        Some(a) if a == "keygen" => run_keygen(&args[1..]),
         _ => {
             print_usage();
             ExitCode::from(2)
@@ -30,22 +36,25 @@ fn print_usage() {
     eprintln!("       wrapfile keygen <KEY_FILE>");
 }
 
-fn run_keygen(args: &[String]) -> ExitCode {
+fn run_keygen(args: &[OsString]) -> ExitCode {
     // A leading "--" marks the end of options, allowing a path that starts
     // with '-' to be passed (e.g. `wrapfile keygen -- -weird-name`).
-    let (args, options_ended): (&[String], bool) = match args {
+    let (args, options_ended): (&[OsString], bool) = match args {
         [first, rest @ ..] if first == "--" => (rest, true),
         _ => (args, false),
     };
-    let path = match args {
+    let path: &OsStr = match args {
         [] => {
             eprintln!("wrapfile keygen: missing key file path");
             print_usage();
             return ExitCode::from(2);
         }
-        [p] if options_ended || !p.starts_with('-') => p,
+        [p] if options_ended || !starts_with_dash(p) => p,
         [p] => {
-            eprintln!("wrapfile keygen: unknown option '{p}'");
+            eprintln!(
+                "wrapfile keygen: unknown option '{}'",
+                display_path(p)
+            );
             print_usage();
             return ExitCode::from(2);
         }
@@ -58,7 +67,7 @@ fn run_keygen(args: &[String]) -> ExitCode {
 
     match generate_key_file(path) {
         Ok(()) => {
-            println!("Key saved to {path}");
+            println!("Key saved to {}", display_path(path));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -68,9 +77,24 @@ fn run_keygen(args: &[String]) -> ExitCode {
     }
 }
 
+// True if the argument begins with '-'. Checked on the raw bytes so a path
+// with non-UTF-8 bytes is classified the same as any other name.
+fn starts_with_dash(arg: &OsStr) -> bool {
+    arg.as_encoded_bytes().first() == Some(&b'-')
+}
+
+// Human-readable rendering of a path for messages only. Lossy conversion may
+// replace non-UTF-8 bytes for display, but this string is never used to
+// touch the filesystem -- the original OsStr is always used for that.
+fn display_path(path: &OsStr) -> std::path::Display<'_> {
+    std::path::Path::new(path).display()
+}
+
 #[cfg(unix)]
-fn generate_key_file(path: &str) -> std::io::Result<()> {
-    let c_path = CString::new(path).map_err(|_| {
+fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
+    // Use the raw OS bytes so a path containing non-UTF-8 bytes refers to
+    // exactly the name the user passed, with no lossy substitution.
+    let c_path = CString::new(path.as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "target path contains a NUL byte",
@@ -112,7 +136,7 @@ fn generate_key_file(path: &str) -> std::io::Result<()> {
         key.fill(0);
         return Err(std::io::Error::new(
             e.kind(),
-            format!("cannot create key file '{path}': {e}"),
+            format!("cannot create key file '{}': {e}", display_path(path)),
         ));
     }
     let fd = fd as RawFd;
@@ -135,7 +159,7 @@ fn generate_key_file(path: &str) -> std::io::Result<()> {
             }
             Err(std::io::Error::new(
                 e.kind(),
-                format!("key file '{path}': {e}"),
+                format!("key file '{}': {e}", display_path(path)),
             ))
         }
         Ok(()) => {
@@ -148,7 +172,10 @@ fn generate_key_file(path: &str) -> std::io::Result<()> {
                 }
                 return Err(std::io::Error::new(
                     e.kind(),
-                    format!("key file '{path}' written but close failed: {e}"),
+                    format!(
+                        "key file '{}' written but close failed: {e}",
+                        display_path(path)
+                    ),
                 ));
             }
             Ok(())
@@ -239,7 +266,7 @@ fn write_all(fd: RawFd, mut data: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn generate_key_file(_path: &str) -> std::io::Result<()> {
+fn generate_key_file(_path: &OsStr) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "keygen is only supported on Unix systems",
