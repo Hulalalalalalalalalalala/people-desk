@@ -51,10 +51,9 @@ fn run_keygen(args: &[OsString]) -> ExitCode {
         }
         [p] if options_ended || !starts_with_dash(p) => p,
         [p] => {
-            eprintln!(
-                "wrapfile keygen: unknown option '{}'",
-                display_path(p)
-            );
+            // render_path already adds the surrounding double quotes when
+            // the option text needs escaping, so no extra quotes go here.
+            eprintln!("wrapfile keygen: unknown option {}", render_path(p));
             print_usage();
             return ExitCode::from(2);
         }
@@ -67,7 +66,7 @@ fn run_keygen(args: &[OsString]) -> ExitCode {
 
     match generate_key_file(path) {
         Ok(()) => {
-            println!("Key saved to {}", display_path(path));
+            println!("Key saved to {}", render_path(path));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -83,11 +82,230 @@ fn starts_with_dash(arg: &OsStr) -> bool {
     arg.as_encoded_bytes().first() == Some(&b'-')
 }
 
-// Human-readable rendering of a path for messages only. Lossy conversion may
-// replace non-UTF-8 bytes for display, but this string is never used to
-// touch the filesystem -- the original OsStr is always used for that.
-fn display_path(path: &OsStr) -> std::path::Display<'_> {
-    std::path::Path::new(path).display()
+// Render a path for messages only.
+//
+// A plain name -- valid UTF-8 with no ASCII control byte, no double quote,
+// and no backslash -- is shown verbatim, exactly as before. Anything else is
+// wrapped in double quotes and rendered with escapes:
+//
+//   \n \r \t   newline, carriage return, tab (so a name can never break a
+//              message across lines or smuggle terminal control bytes in)
+//   \"  \\     double quote and backslash
+//   \xhh       every other ASCII control byte, and every raw byte that is
+//              not part of valid UTF-8, as two lowercase hex digits
+//
+// Decodable non-ASCII text (e.g. Chinese characters) is kept as-is inside
+// the quotes. The result therefore never contains a raw ASCII control byte
+// (the line terminator printed after the message is the only one), and two
+// different raw names always render differently: a real 0xff byte shows as
+// `\xff` while a name literally containing those four characters shows as
+// `\\xff`, and a real newline shows as `\n` while a backslash followed by
+// `n` shows as `\\n`.
+//
+// This string is purely informational -- it is never used to create, look
+// up, or remove anything. The original OsStr is used for every filesystem
+// operation, so non-UTF-8 names are still operated on byte for byte.
+#[cfg(unix)]
+fn render_path(path: &OsStr) -> String {
+    const QUOTE: u8 = b'"';
+    const BACKSLASH: u8 = b'\\';
+
+    let bytes = path.as_encoded_bytes();
+
+    // Valid UTF-8 with nothing that needs an escape: keep the historical
+    // bare display (and the bare "Key saved to ..." wording).
+    if std::str::from_utf8(bytes).is_ok()
+        && bytes
+            .iter()
+            .all(|&b| b >= 0x20 && b != QUOTE && b != BACKSLASH && b != 0x7f)
+    {
+        return String::from_utf8(bytes.to_vec()).unwrap();
+    }
+
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+
+    // Walk the raw bytes, stepping over whole UTF-8 sequences so a valid
+    // multi-byte character is shown intact while an undecodable byte is
+    // escaped on its own.
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if b < 0x80 {
+            match b {
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                QUOTE => out.push_str("\\\""),
+                BACKSLASH => out.push_str("\\\\"),
+                // Printable ASCII (0x20..=0x7e except the two handled above)
+                // is shown as itself.
+                0x20..=0x7e => out.push(b as char),
+                // Every remaining ASCII control byte (including NUL and
+                // DEL) is rendered explicitly.
+                _ => out.push_str(&format!("\\x{b:02x}")),
+            }
+            i += 1;
+            continue;
+        }
+
+        // Length of the UTF-8 sequence starting here.
+        let seq_len = if b & 0xe0 == 0xc0 {
+            2
+        } else if b & 0xf0 == 0xe0 {
+            3
+        } else if b & 0xf8 == 0xf0 {
+            4
+        } else {
+            // 0x80..0xbf continuation byte, or 0xf8..0xff lead: never legal
+            // here.
+            1
+        };
+
+        if seq_len > 1
+            && i + seq_len <= bytes.len()
+            && std::str::from_utf8(&bytes[i..i + seq_len]).is_ok()
+        {
+            // from_utf8 on a maximal, well-formed sequence succeeds; push the
+            // character as text so e.g. Chinese names keep their glyphs.
+            out.push_str(std::str::from_utf8(&bytes[i..i + seq_len]).unwrap());
+            i += seq_len;
+        } else {
+            out.push_str(&format!("\\x{b:02x}"));
+            i += 1;
+        }
+    }
+
+    out.push('"');
+    out
+}
+
+// On non-Unix targets keygen never reaches the filesystem; keep the message
+// rendering lossy-but-inert there (control bytes are still escaped) rather
+// than duplicating the byte-level renderer.
+#[cfg(not(unix))]
+fn render_path(path: &OsStr) -> String {
+    use std::fmt::Write as _;
+    let text = path.to_string_lossy();
+    if text
+        .chars()
+        .all(|c| c as u32 >= 0x20 && c != '"' && c != '\\' && c as u32 != 0x7f)
+    {
+        return text.into_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(all(test, unix))]
+mod path_render_tests {
+    use super::render_path;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn r(raw: &[u8]) -> String {
+        render_path(OsStr::from_bytes(raw))
+    }
+
+    #[test]
+    fn plain_ascii_and_ordinary_utf8_stay_bare() {
+        assert_eq!(r(b"path/to/backup.key"), "path/to/backup.key");
+        assert_eq!(r(b"-weird-name"), "-weird-name");
+        // Decodable non-ASCII text is shown as itself, unquoted.
+        assert_eq!(r("密钥/备份.key".as_bytes()), "密钥/备份.key");
+    }
+
+    #[test]
+    fn named_escapes_render_as_literal_two_char_sequences() {
+        assert_eq!(r(b"a\nb"), r#""a\nb""#);
+        assert_eq!(r(b"a\rb"), r#""a\rb""#);
+        assert_eq!(r(b"a\tb"), r#""a\tb""#);
+    }
+
+    #[test]
+    fn quote_and_backslash_are_escaped_inside_quotes() {
+        assert_eq!(r(b"a\"b"), r#""a\"b""#);
+        assert_eq!(r(b"a\\b"), r#""a\\b""#);
+    }
+
+    #[test]
+    fn other_control_bytes_use_hex_and_split_no_lines() {
+        assert_eq!(r(b"a\x1bb"), r#""a\x1bb""#); // ESC
+        assert_eq!(r(b"\x00"), r#""\x00""#);
+        assert_eq!(r(b"\x7f"), r#""\x7f""#);
+        let rendered = r(b"a\x07\x1bc");
+        assert!(
+            !rendered.bytes().any(|b| b < 0x20 || b == 0x7f),
+            "rendering must not retain raw control bytes: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_use_hex_but_valid_text_around_remains() {
+        assert_eq!(r(b"key-\xff"), r#""key-\xff""#);
+        assert_eq!(r(b"key-\xff raw \xfe.bin"), r#""key-\xff raw \xfe.bin""#);
+        assert_eq!(r(b"-\xffkey"), r#""-\xffkey""#);
+        // A valid multibyte run next to a broken byte keeps its glyphs.
+        let mut mixed = "密钥".as_bytes().to_vec();
+        mixed.push(0xff);
+        assert_eq!(r(&mixed), r#""密钥\xff""#);
+        // Truncated multibyte lead/continuation bytes are each escaped.
+        assert_eq!(r(b"\xe4\xbd"), r#""\xe4\xbd""#);
+        assert_eq!(r(b"a\x80b"), r#""a\x80b""#);
+    }
+
+    #[test]
+    fn real_illegal_byte_differs_from_literal_backslash_text() {
+        // A real 0xff byte ...
+        assert_eq!(r(b"\xff"), r#""\xff""#);
+        // ... is not the same visible target as a name containing the four
+        // literal characters \, x, f, f.
+        assert_eq!(r(b"\\xff"), r#""\\xff""#);
+        assert_ne!(r(b"\xff"), r(b"\\xff"));
+
+        // Real newline vs the two characters backslash-n.
+        assert_eq!(r(b"a\nb"), r#""a\nb""#);
+        assert_eq!(r(b"a\\nb"), r#""a\\nb""#);
+        assert_ne!(r(b"a\nb"), r(b"a\\nb"));
+    }
+
+    #[test]
+    fn distinct_illegal_bytes_do_not_share_a_rendering() {
+        assert_eq!(r(b"key-\xff"), r#""key-\xff""#);
+        assert_eq!(r(b"key-\xfe"), r#""key-\xfe""#);
+        assert_ne!(r(b"key-\xff"), r(b"key-\xfe"));
+    }
+
+    #[test]
+    fn rendering_contains_no_raw_control_bytes_except_as_appended_newline() {
+        for name in [
+            &b"a\nb\x1bc\r\t"[..],
+            &b"\x00\x01\x02\x1b\x7f"[..],
+            &b"ok\xff\n"[..],
+        ] {
+            let rendered = r(name);
+            assert!(
+                !rendered.bytes().any(|b| b < 0x20 || b == 0x7f),
+                "raw control byte survived in {rendered:?} for {name:?}"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -136,7 +354,7 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
         key.fill(0);
         return Err(std::io::Error::new(
             e.kind(),
-            format!("cannot create key file '{}': {e}", display_path(path)),
+            format!("cannot create key file {}: {e}", render_path(path)),
         ));
     }
     let fd = fd as RawFd;
@@ -221,19 +439,19 @@ fn abort_save(
         None => std::io::Error::new(
             kind,
             format!(
-                "key file '{}' was not saved: {stage}; the file created by \
+                "key file {} was not saved: {stage}; the file created by \
                  this invocation has been removed",
-                display_path(path)
+                render_path(path)
             ),
         ),
         Some(ue) => std::io::Error::new(
             kind,
             format!(
-                "key file '{}' was not saved: {stage}; cleanup of the \
+                "key file {} was not saved: {stage}; cleanup of the \
                  incomplete file also failed ({ue}): a file created by this \
                  failed run may still be present at the target -- check and \
                  remove it yourself",
-                display_path(path)
+                render_path(path)
             ),
         ),
     }
