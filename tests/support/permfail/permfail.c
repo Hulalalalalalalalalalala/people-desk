@@ -10,18 +10,39 @@
  *      FCHMOD      ret=0/-1 mode=0oNNNN
  *      FSTAT       ret=0/-1 mode=0oNNNN size=N   (mode reported to guest)
  *      FIRST_WRITE mode=0oNNNN size=N  immediately before the first write()
+ *      WRITE       off=N len=M hex=..  a write() the kernel accepted: file
+ *                                      offset, byte count, and the exact
+ *                                      bytes (hex) taken from the guest's
+ *                                      buffer, so a test can reconstruct the
+ *                                      byte stream the file must contain
+ *      WRITE_EINTR                     write() failed with EINTR (no bytes
+ *                                      accepted); the guest should retry
+ *      WRITE_FAIL  off=N errno=EIO     write() failed unrecoverably
+ *      FSYNC       ret=0/-1            fsync() outcome on the key file
  *
  *    FIRST_WRITE with mode=0o600 and size=0 proves the program had both set
  *    and *confirmed* 0600 before a single key byte was written.
  *
  * 2. Fault injection (only for a descriptor the guest itself created):
- *      WRAPFILE_TEST_FAIL_FCHMOD=1  fchmod() fails with EPERM
- *      WRAPFILE_TEST_FAIL_FSTAT=1   fstat()/fstat64() fail (EBADF), so the
- *                                    resulting mode cannot be confirmed
- *      WRAPFILE_TEST_LIE_MODE=OCTAL fstat reports these low 12 mode bits
- *                                    (e.g. 0000) while the real fchmod
- *                                    succeeded -- a filesystem that silently
- *                                    stores another mode
+ *      WRAPFILE_TEST_FAIL_FCHMOD=1      fchmod() fails with EPERM
+ *      WRAPFILE_TEST_FAIL_FSTAT=1       fstat()/fstat64() fail (EBADF), so the
+ *                                        resulting mode cannot be confirmed
+ *      WRAPFILE_TEST_LIE_MODE=OCTAL     fstat reports these low 12 mode bits
+ *                                        (e.g. 0000) while the real fchmod
+ *                                        succeeded -- a filesystem that silently
+ *                                        stores another mode
+ *      WRAPFILE_TEST_PARTIAL_WRITE=N    write() accepts at most N bytes per
+ *                                        call (a kernel that only takes part
+ *                                        of the buffer each time)
+ *      WRAPFILE_TEST_EINTR_WRITES=N     the first N write() calls fail with
+ *                                        EINTR without accepting any bytes,
+ *                                        then writes go through normally
+ *      WRAPFILE_TEST_FAIL_WRITE_AFTER=N once N bytes have been accepted,
+ *                                        further write() calls fail with EIO
+ *                                        (combine with PARTIAL_WRITE to land
+ *                                        a partial key on disk first)
+ *      WRAPFILE_TEST_FAIL_FSYNC=1       fsync() fails with EIO after all
+ *                                        bytes were written
  *
  * The shim only activates inside an executable whose basename starts with
  * "wrapfile" (checked via /proc/self/exe), so a wrapper shell used to set
@@ -52,6 +73,7 @@ typedef int (*fchmod_fn)(int, mode_t);
 typedef int (*fstat_fn)(int, struct stat *);
 typedef int (*fstat64_fn)(int, struct stat64 *);
 typedef ssize_t (*write_fn)(int, const void *, size_t);
+typedef int (*fsync_fn)(int);
 
 static open_fn    real_open;
 static open64_fn  real_open64;
@@ -59,15 +81,23 @@ static fchmod_fn  real_fchmod;
 static fstat_fn   real_fstat;
 static fstat64_fn real_fstat64;
 static write_fn   real_write;
+static fsync_fn   real_fsync;
 
-static int cfg_fail_fchmod = 0;
-static int cfg_fail_fstat  = 0;
-static int cfg_lie_mode    = -1; /* -1 = disabled */
+static int  cfg_fail_fchmod = 0;
+static int  cfg_fail_fstat  = 0;
+static int  cfg_lie_mode    = -1; /* -1 = disabled */
+static long cfg_partial_write = 0;    /* 0 = accept the full buffer */
+static long cfg_eintr_writes = 0;     /* write() calls to fail with EINTR */
+static long cfg_fail_write_after = -1;/* -1 = never fail writes */
+static int  cfg_fail_fsync = 0;
+
+static long eintr_writes_remaining = 0;
 
 /* Descriptor table: fds the guest created with O_CREAT. */
 #define FD_MAX 1024
 static unsigned char tracked[FD_MAX];
 static unsigned char written[FD_MAX];
+static off_t accepted[FD_MAX]; /* bytes the kernel has taken so far */
 
 /* ----- activation: only inside the wrapfile executable ----- */
 
@@ -106,6 +136,18 @@ static void load_config(void)
         (void)v; /* opened lazily on first trace() */
     if ((v = getenv("WRAPFILE_TEST_LIE_MODE")) && v[0] != '\0')
         cfg_lie_mode = (int)strtol(v, NULL, 8);
+    if ((v = getenv("WRAPFILE_TEST_PARTIAL_WRITE")) && v[0] != '\0') {
+        cfg_partial_write = strtol(v, NULL, 10);
+        if (cfg_partial_write < 1)
+            cfg_partial_write = 1;
+    }
+    if ((v = getenv("WRAPFILE_TEST_EINTR_WRITES")) && v[0] != '\0')
+        cfg_eintr_writes = strtol(v, NULL, 10);
+    if ((v = getenv("WRAPFILE_TEST_FAIL_WRITE_AFTER")) && v[0] != '\0')
+        cfg_fail_write_after = strtol(v, NULL, 10);
+    if ((v = getenv("WRAPFILE_TEST_FAIL_FSYNC")) && v[0] == '1')
+        cfg_fail_fsync = 1;
+    eintr_writes_remaining = cfg_eintr_writes;
 }
 
 static int trace_fd(void)
@@ -161,6 +203,7 @@ static void note_created(int fd)
         return;
     tracked[fd] = 1;
     written[fd] = 0;
+    accepted[fd] = 0;
 
     struct stat st;
     fstat_fn fn = get_real_fstat();
@@ -219,6 +262,33 @@ static int handle_fstat(int fd, void *st, int is64)
     trace("FSTAT ret=0 mode=0%04o size=%lld\n",
           (unsigned)(reported & 07777), (long long)real_size);
     return 0;
+}
+
+/*
+ * Log a WRITE event with the exact bytes the kernel accepted, hex-encoded,
+ * so the test can reconstruct the byte stream the file must contain. The
+ * trace file is test infrastructure, not program output; key bytes never
+ * reach the guest's stdout/stderr through this path.
+ */
+static void trace_write_event(off_t off, const void *buf, ssize_t n)
+{
+    if (trace_fd() < 0)
+        return;
+    if (n > 256) { /* key writes are 32 bytes; cap just in case */
+        trace("WRITE off=%lld len=%zd hex=skipped\n", (long long)off, n);
+        return;
+    }
+    char line[600];
+    int pos = snprintf(line, sizeof(line), "WRITE off=%lld len=%zd hex=",
+                       (long long)off, n);
+    const unsigned char *p = (const unsigned char *)buf;
+    for (ssize_t i = 0; i < n && pos < (int)sizeof(line) - 3; i++) {
+        snprintf(line + pos, 3, "%02x", p[i]);
+        pos += 2;
+    }
+    line[pos++] = '\n';
+    line[pos] = '\0';
+    trace("%s", line);
 }
 
 /* ----- intercepted libc functions ----- */
@@ -325,8 +395,11 @@ ssize_t write(int fd, const void *buf, size_t count)
     if (!real_write)
         real_write = (write_fn)dlsym(RTLD_NEXT, "write");
 
-    if (process_active() && is_tracked(fd) && !written[fd]) {
-        load_config();
+    if (!process_active() || !is_tracked(fd))
+        return real_write(fd, buf, count);
+    load_config();
+
+    if (!written[fd]) {
         written[fd] = 1;
         struct stat st;
         fstat_fn fn = get_real_fstat();
@@ -338,5 +411,52 @@ ssize_t write(int fd, const void *buf, size_t count)
             trace("FIRST_WRITE mode=unknown size=unknown\n");
         }
     }
-    return real_write(fd, buf, count);
+
+    /* Recoverable interruption: the first N write() calls fail with EINTR
+       without accepting any bytes; the guest is expected to retry the
+       same generation rather than give up. */
+    if (eintr_writes_remaining > 0) {
+        eintr_writes_remaining--;
+        trace("WRITE_EINTR\n");
+        errno = EINTR;
+        return -1;
+    }
+
+    /* Unrecoverable failure once N bytes have been accepted. */
+    if (cfg_fail_write_after >= 0 && accepted[fd] >= cfg_fail_write_after) {
+        trace("WRITE_FAIL off=%lld errno=EIO\n", (long long)accepted[fd]);
+        errno = EIO;
+        return -1;
+    }
+
+    /* A kernel that only accepts part of the buffer per call. */
+    size_t n = count;
+    if (cfg_partial_write > 0 && n > (size_t)cfg_partial_write)
+        n = (size_t)cfg_partial_write;
+
+    ssize_t rc = real_write(fd, buf, n);
+    if (rc > 0) {
+        trace_write_event(accepted[fd], buf, rc);
+        accepted[fd] += rc;
+    }
+    return rc;
+}
+
+int fsync(int fd)
+{
+    if (!real_fsync)
+        real_fsync = (fsync_fn)dlsym(RTLD_NEXT, "fsync");
+
+    if (!process_active() || !is_tracked(fd))
+        return real_fsync(fd);
+    load_config();
+
+    if (cfg_fail_fsync) {
+        trace("FSYNC ret=-1 errno=EIO\n");
+        errno = EIO;
+        return -1;
+    }
+    int rc = real_fsync(fd);
+    trace("FSYNC ret=%d\n", rc);
+    return rc;
 }
