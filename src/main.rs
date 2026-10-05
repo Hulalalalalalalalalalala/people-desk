@@ -152,15 +152,38 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
             // Unlink while our fd is still open: only the link to the inode
             // we just created is removed, never an object that predates this
             // invocation. Then close (on Linux the fd is closed regardless
-            // of the returned error, so it must not be retried).
+            // of the returned error, so it must not be retried). The unlink
+            // error is captured before close() can clobber errno.
+            let unlink_failed = unsafe { libc::unlink(c_path.as_ptr()) } != 0;
+            let unlink_err = unlink_failed.then(std::io::Error::last_os_error);
             unsafe {
-                libc::unlink(c_path.as_ptr());
                 libc::close(fd);
             }
-            Err(std::io::Error::new(
-                e.kind(),
-                format!("key file '{}': {e}", display_path(path)),
-            ))
+            match unlink_err {
+                // Cleanup succeeded: nothing of this invocation remains at
+                // the target, so the plain save-failure report is complete.
+                None => Err(std::io::Error::new(
+                    e.kind(),
+                    format!("key file '{}': {e}", display_path(path)),
+                )),
+                // The system refused to remove this invocation's file, so
+                // an empty file, a partial key, or an unsynced full key may
+                // still sit at the target. Report both facts -- the original
+                // failure (kept verbatim, not replaced by the unlink error)
+                // and the unfinished cleanup -- so the residue is not
+                // mistaken for a saved key. Never work around the refusal
+                // (e.g. by loosening the parent directory's permissions or
+                // renaming the file to another name).
+                Some(ue) => Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "key file '{}': {e}; cleanup of the incomplete file \
+                         also failed ({ue}): the file created by this \
+                         invocation may still be present at the target",
+                        display_path(path)
+                    ),
+                )),
+            }
         }
         Ok(()) => {
             // All 32 bytes were written and fsynced, but the save is only
