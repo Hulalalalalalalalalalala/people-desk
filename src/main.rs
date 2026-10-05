@@ -152,15 +152,39 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
             // Unlink while our fd is still open: only the link to the inode
             // we just created is removed, never an object that predates this
             // invocation. Then close (on Linux the fd is closed regardless
-            // of the returned error, so it must not be retried).
-            unsafe {
-                libc::unlink(c_path.as_ptr());
-                libc::close(fd);
+            // of the returned error, so it must not be retried). Capture the
+            // unlink result before close, which may clobber errno.
+            let unlink_err = if unsafe { libc::unlink(c_path.as_ptr()) } == 0 {
+                None
+            } else {
+                Some(std::io::Error::last_os_error())
+            };
+            unsafe { libc::close(fd) };
+            match unlink_err {
+                None => Err(std::io::Error::new(
+                    e.kind(),
+                    format!("key file '{}': {e}", display_path(path)),
+                )),
+                // The system refused to remove this invocation's file --
+                // whatever it holds (an empty file, a partial key, or 32
+                // bytes that were never synced), it is not a saved key.
+                // Keep the original failure, add the cleanup failure and
+                // its reason, and say plainly that the file may still sit
+                // at the target so the user can check and remove it. Never
+                // claim it is gone, and never work around the refusal (e.g.
+                // by loosening the parent directory's permissions or
+                // stashing the key under another name).
+                Some(ue) => Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "key file '{}' was not saved: {e}; cleanup of the \
+                         incomplete file also failed ({ue}): a file created \
+                         by this failed run may still be present at the \
+                         target -- check and remove it yourself",
+                        display_path(path)
+                    ),
+                )),
             }
-            Err(std::io::Error::new(
-                e.kind(),
-                format!("key file '{}': {e}", display_path(path)),
-            ))
         }
         Ok(()) => {
             // All 32 bytes were written and fsynced, but the save is only
@@ -263,8 +287,12 @@ fn ensure_owner_only_mode(fd: RawFd) -> std::io::Result<()> {
 #[cfg(unix)]
 fn write_key(fd: RawFd, key: &[u8; KEY_LEN]) -> std::io::Result<()> {
     // Caller has already run ensure_owner_only_mode: the inode carries
-    // exactly 0600 before the first secret byte reaches it.
-    write_all(fd, key)?;
+    // exactly 0600 before the first secret byte reaches it. Failures are
+    // labelled with the stage so the user can tell an unfinished write
+    // apart from a permission or sync problem.
+    write_all(fd, key).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("could not write key file: {e}"))
+    })?;
 
     if unsafe { libc::fsync(fd) } != 0 {
         let e = std::io::Error::last_os_error();

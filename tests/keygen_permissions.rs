@@ -16,7 +16,9 @@
 //!   keygen exits 1, reports the permission problem on stderr, prints no
 //!   success message, writes no key bytes, and removes the partial file --
 //!   without touching pre-existing files, directories, symlinks, or the
-//!   parent directory.
+//!   parent directory. If the system also refuses to remove this run's
+//!   file, stderr keeps the permission problem, reports the failed cleanup,
+//!   and warns that this run's file may still be present at the target.
 //! * Existing CLI behaviour (--version, usage/exit code 2) is unchanged.
 #![cfg(unix)]
 
@@ -578,4 +580,114 @@ fn version_and_argument_handling_unchanged() {
     // Totally unknown invocation -> 2 as well.
     let run = run_args(&["frobnicate"]);
     assert_eq!(run.rc, 2);
+}
+
+#[test]
+fn fchmod_rejection_with_unlink_refused_reports_both_and_warns_of_residue() {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new("fchmod-fail-unlink-refused");
+    let key = tmp.child("key");
+    let sibling = Sentinel::file(&tmp.path, "sibling", b"keep-me", 0o600);
+    let parent_mode_before = mode_of(&tmp.path);
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // The filesystem refuses to set the required mode, and the system then
+    // refuses to remove this run's (empty) file. The command must report
+    // both the permission problem and the unfinished cleanup.
+    let run = run_keygen(
+        &key,
+        0o022,
+        Some(&so),
+        &[
+            ("WRAPFILE_TEST_FAIL_FCHMOD", "1"),
+            ("WRAPFILE_TEST_FAIL_UNLINK", "1"),
+        ],
+        Some(&trace),
+    );
+
+    let events = parse_trace(&trace);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "FCHMOD" && e.ret() == Some(-1)),
+        "the fchmod failure must have been injected"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "UNLINK" && e.get("errno") == Some("EACCES")),
+        "the refused cleanup must have been injected"
+    );
+    // No key byte was ever written: the residue is a mere empty file.
+    assert!(
+        events.iter().all(|e| e.kind != "WRITE" && e.kind != "FIRST_WRITE"),
+        "no key byte may be written when the permissions cannot be guaranteed"
+    );
+
+    assert_eq!(run.rc, 1, "a failed save with refused cleanup must exit 1");
+    assert!(
+        run.out.is_empty(),
+        "no success message on failure, got {}",
+        String::from_utf8_lossy(&run.out)
+    );
+    let stderr = String::from_utf8_lossy(&run.err);
+    assert!(
+        stderr.contains(&key.display().to_string()),
+        "stderr should name the target path, got: {stderr}"
+    );
+    // The original permission problem is still reported...
+    assert!(
+        stderr.contains("0600") || stderr.to_lowercase().contains("permission"),
+        "stderr must keep the permission problem, got: {stderr}"
+    );
+    // ...the cleanup failure is reported too...
+    assert!(
+        stderr.contains("cleanup"),
+        "stderr must report the failed cleanup, got: {stderr}"
+    );
+    // ...and the user is warned that this run's file may remain -- even
+    // though it is only an empty file, it must not be mistaken for a key.
+    assert!(
+        stderr.contains("may still be present"),
+        "stderr must warn that this run's file may remain, got: {stderr}"
+    );
+
+    // The refused removal means this run's empty file really is still at
+    // the target; nothing was stashed under another name.
+    assert!(
+        key.exists(),
+        "with unlink refused, this run's file remains at the target"
+    );
+    assert_eq!(
+        fs::read(&key).unwrap().len(),
+        0,
+        "the residue must be the empty file exactly as the failed run left it"
+    );
+    let mut entries: Vec<String> = fs::read_dir(&tmp.path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec!["key".to_string(), "sibling".to_string(), "trace.log".to_string()],
+        "no renamed copy or other leftover may appear"
+    );
+    sibling.assert_untouched();
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_mode_before,
+        "parent directory permissions must never be loosened to force cleanup"
+    );
+
+    // Remove the residue manually; a fault-free retry then succeeds.
+    fs::remove_file(&key).unwrap();
+    let trace2 = prepare_trace(&tmp.path, "trace2.log");
+    let run2 = run_keygen(&key, 0o022, Some(&so), &[], Some(&trace2));
+    assert_key_file_ok(&key, &run2);
+    sibling.assert_untouched();
 }

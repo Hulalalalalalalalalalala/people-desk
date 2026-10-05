@@ -36,6 +36,12 @@
 //!   never loosened to force the cleanup, and the key is not stashed under
 //!   another name. A close() that merely reports EINTR after releasing the
 //!   descriptor is not a failure: the save is reported as usual, exit 0.
+//! * Refused cleanup after a write/fsync/permission-stage failure: the same
+//!   reporting rule as for the close stage -- exit 1, empty stdout, stderr
+//!   keeps the original failure reason (unfinished write, failed sync, or
+//!   the 0600 permission problem), additionally reports the failed cleanup
+//!   and its reason, and warns that this run's file (even an empty one) may
+//!   still be present at the target so the user can check and remove it.
 //!
 //! The faults are injected by the LD_PRELOAD shim (tests/support/permfail),
 //! which also traces every write()/fsync() on the key descriptor so the
@@ -342,6 +348,66 @@ fn assert_key_material_not_leaked(run: &Run, material: &[u8], what: &str) {
         !out.contains(&hex) && !err.contains(&hex),
         "{what} must never appear on stdout/stderr in hex form"
     );
+}
+
+/// The contract when the save fails AND the system refuses to remove this
+/// run's file: exit 1, empty stdout, stderr names the target, keeps the
+/// original failure reason (`stage_reason`), reports the refused cleanup,
+/// and warns that this run's file may remain -- and the file really does
+/// remain, with nothing stashed under another name.
+fn assert_failed_with_residue(
+    key: &Path,
+    run: &Run,
+    dir: &Path,
+    allowed_entries: &[&str],
+    stage_reason: &str,
+) {
+    assert_eq!(run.rc, 1, "a failed save with refused cleanup must exit 1");
+    assert!(
+        run.out.is_empty(),
+        "no success message may be printed, got {}",
+        String::from_utf8_lossy(&run.out)
+    );
+    let stderr = String::from_utf8_lossy(&run.err);
+    assert!(
+        stderr.contains(&key.display().to_string()),
+        "stderr should name the target path, got: {stderr}"
+    );
+    // The original failure reason is still reported...
+    assert!(
+        stderr.contains(stage_reason),
+        "stderr must keep the original failure reason ({stage_reason:?}), got: {stderr}"
+    );
+    // ...the cleanup failure is reported too (not silently dropped, and not
+    // replacing the save error)...
+    assert!(
+        stderr.contains("cleanup"),
+        "stderr must report the failed cleanup, got: {stderr}"
+    );
+    // ...and the user is told this run's file may remain -- never that it
+    // is gone.
+    assert!(
+        stderr.contains("may still be present"),
+        "stderr must warn that this run's file may remain, got: {stderr}"
+    );
+
+    // The refused removal means this run's file really is still at the
+    // target -- the warning above is what keeps it from being mistaken for
+    // a successfully saved key.
+    assert!(
+        key.exists(),
+        "with unlink refused, this run's file remains at the target"
+    );
+    // Nothing was stashed under another name and no other residue appeared.
+    let mut expected: Vec<String> = allowed_entries.iter().map(|s| s.to_string()).collect();
+    expected.push(key.file_name().unwrap().to_string_lossy().into_owned());
+    expected.sort();
+    let mut entries: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, expected, "no renamed copy or other leftover may appear");
 }
 
 // A pre-existing object that must survive a failed keygen byte-for-byte.
@@ -916,6 +982,233 @@ fn close_error_with_unlink_refused_reports_both_and_warns_of_residue() {
             "trace.log".to_string()
         ],
         "no renamed copy or other leftover may appear"
+    );
+    sibling.assert_untouched();
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_mode_before,
+        "parent directory permissions must never be loosened to force cleanup"
+    );
+
+    // Remove the residue manually; a fault-free retry then succeeds.
+    fs::remove_file(&key).unwrap();
+    let trace2 = prepare_trace(&tmp.path, "trace2.log");
+    let run2 = run_keygen(&key, 0o022, &so, &[], &trace2);
+    assert_success(&key, &run2);
+    sibling.assert_untouched();
+}
+
+#[test]
+fn write_error_with_unlink_refused_reports_both_and_warns_of_residue() {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new("write-error-unlink-refused");
+    let key = tmp.child("key");
+    let sibling = Sentinel::file(&tmp.path, "sibling", b"do-not-touch", 0o644);
+    let parent_mode_before = mode_of(&tmp.path);
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // Ten bytes land, write() then fails unrecoverably, and the system
+    // refuses to remove the partial file. The command must report both the
+    // write failure and the unfinished cleanup.
+    let run = run_keygen(
+        &key,
+        0o022,
+        &so,
+        &[
+            ("WRAPFILE_TEST_PARTIAL_WRITE", "4"),
+            ("WRAPFILE_TEST_FAIL_WRITE_AFTER", "10"),
+            ("WRAPFILE_TEST_FAIL_UNLINK", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+
+    let events = parse_trace(&trace);
+    let writes = successful_writes(&events);
+    assert_writes_tile(&writes, 10, "writes before the error");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "WRITE" && e.get("errno") == Some("EIO")),
+        "the unrecoverable write error must have been injected"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "UNLINK" && e.get("errno") == Some("EACCES")),
+        "the refused cleanup must have been injected"
+    );
+    let partial_key = reconstruct(&writes);
+    assert_eq!(partial_key.len(), 10);
+
+    assert_failed_with_residue(
+        &key,
+        &run,
+        &tmp.path,
+        &["sibling", "trace.log"],
+        "could not write key file",
+    );
+    assert_key_material_not_leaked(&run, &partial_key, "the partial key");
+
+    // The residue is the 10-byte partial file -- not padded to 32 bytes,
+    // not renamed, and not to be mistaken for a saved key.
+    assert_eq!(
+        fs::read(&key).unwrap().len(),
+        10,
+        "the residue must be the partial file exactly as the failed run left it"
+    );
+    sibling.assert_untouched();
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_mode_before,
+        "parent directory permissions must never be loosened to force cleanup"
+    );
+
+    // Remove the residue manually; a fault-free retry then succeeds.
+    fs::remove_file(&key).unwrap();
+    let trace2 = prepare_trace(&tmp.path, "trace2.log");
+    let run2 = run_keygen(&key, 0o022, &so, &[], &trace2);
+    assert_success(&key, &run2);
+    sibling.assert_untouched();
+}
+
+#[test]
+fn fsync_error_with_unlink_refused_reports_both_and_warns_of_residue() {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new("fsync-error-unlink-refused");
+    let key = tmp.child("key");
+    let sibling = Sentinel::file(&tmp.path, "sibling", b"keep-me", 0o600);
+    let parent_mode_before = mode_of(&tmp.path);
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // All 32 bytes are written, the sync fails, and the system refuses to
+    // remove the file. Even though the residue holds a full 32-byte key,
+    // the save did not complete: both failures must be reported.
+    let run = run_keygen(
+        &key,
+        0o022,
+        &so,
+        &[
+            ("WRAPFILE_TEST_FAIL_FSYNC", "1"),
+            ("WRAPFILE_TEST_FAIL_UNLINK", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+
+    let events = parse_trace(&trace);
+    let writes = successful_writes(&events);
+    assert_writes_tile(&writes, KEY_LEN, "writes before fsync");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "FSYNC" && e.ret() == Some(-1)),
+        "the fsync failure must have been injected"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "UNLINK" && e.get("errno") == Some("EACCES")),
+        "the refused cleanup must have been injected"
+    );
+    let full_key = reconstruct(&writes);
+    assert_eq!(full_key.len(), KEY_LEN);
+
+    assert_failed_with_residue(
+        &key,
+        &run,
+        &tmp.path,
+        &["sibling", "trace.log"],
+        "could not flush key file",
+    );
+    assert_key_material_not_leaked(&run, &full_key, "the unsynced key");
+
+    // The residue happens to hold 32 bytes, but it was never synced: it is
+    // not a saved key and must not be reported as one.
+    assert_eq!(fs::read(&key).unwrap().len(), KEY_LEN);
+    sibling.assert_untouched();
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_mode_before,
+        "parent directory permissions must never be loosened to force cleanup"
+    );
+
+    // Remove the residue manually; a fault-free retry then succeeds.
+    fs::remove_file(&key).unwrap();
+    let trace2 = prepare_trace(&tmp.path, "trace2.log");
+    let run2 = run_keygen(&key, 0o022, &so, &[], &trace2);
+    assert_success(&key, &run2);
+    sibling.assert_untouched();
+}
+
+#[test]
+fn zero_byte_write_with_unlink_refused_warns_about_empty_residue() {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new("write-zero-unlink-refused");
+    let key = tmp.child("key");
+    let sibling = Sentinel::file(&tmp.path, "sibling", b"do-not-touch", 0o644);
+    let parent_mode_before = mode_of(&tmp.path);
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // The very first write() accepts 0 bytes, and the system then refuses
+    // to remove the file. The residue is a mere empty file -- the warning
+    // must still be honest about it possibly sitting at the target.
+    let run = run_keygen(
+        &key,
+        0o022,
+        &so,
+        &[
+            ("WRAPFILE_TEST_WRITE_ZERO_AFTER", "0"),
+            ("WRAPFILE_TEST_FAIL_UNLINK", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+
+    let events = parse_trace(&trace);
+    assert!(
+        successful_writes(&events).is_empty(),
+        "no key byte may be written when write() accepts nothing"
+    );
+    assert!(
+        !zero_writes(&events).is_empty(),
+        "the zero-byte write must have been injected"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "UNLINK" && e.get("errno") == Some("EACCES")),
+        "the refused cleanup must have been injected"
+    );
+    let full_key = rejected_offerings(&events);
+    assert_eq!(full_key.len(), KEY_LEN);
+
+    assert_failed_with_residue(
+        &key,
+        &run,
+        &tmp.path,
+        &["sibling", "trace.log"],
+        "incomplete write",
+    );
+    assert_key_material_not_leaked(&run, &full_key, "the rejected key");
+
+    // The residue really is the empty file this run created.
+    assert_eq!(
+        fs::read(&key).unwrap().len(),
+        0,
+        "the residue must be the empty file exactly as the failed run left it"
     );
     sibling.assert_untouched();
     assert_eq!(
