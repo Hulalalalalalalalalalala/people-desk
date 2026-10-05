@@ -142,97 +142,100 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
     let fd = fd as RawFd;
 
     // Enforce and confirm exactly 0600 before writing, then write and fsync.
-    // On any failure the inode we just created is unlinked below; an object
-    // predating this invocation is never touched.
+    // On any failure the inode we just created is unlinked by abort_save; an
+    // object predating this invocation is never touched.
     let outcome = ensure_owner_only_mode(fd).and_then(|()| write_key(fd, &key));
     key.fill(0);
 
     match outcome {
-        Err(e) => {
-            // Unlink while our fd is still open: only the link to the inode
-            // we just created is removed, never an object that predates this
-            // invocation. Then close (on Linux the fd is closed regardless
-            // of the returned error, so it must not be retried). Capture the
-            // unlink result before close, which may clobber errno.
-            let unlink_err = if unsafe { libc::unlink(c_path.as_ptr()) } == 0 {
-                None
-            } else {
-                Some(std::io::Error::last_os_error())
-            };
-            unsafe { libc::close(fd) };
-            match unlink_err {
-                None => Err(std::io::Error::new(
-                    e.kind(),
-                    format!("key file '{}': {e}", display_path(path)),
-                )),
-                // The system refused to remove this invocation's file --
-                // whatever it holds (an empty file, a partial key, or 32
-                // bytes that were never synced), it is not a saved key.
-                // Keep the original failure, add the cleanup failure and
-                // its reason, and say plainly that the file may still sit
-                // at the target so the user can check and remove it. Never
-                // claim it is gone, and never work around the refusal (e.g.
-                // by loosening the parent directory's permissions or
-                // stashing the key under another name).
-                Some(ue) => Err(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "key file '{}' was not saved: {e}; cleanup of the \
-                         incomplete file also failed ({ue}): a file created \
-                         by this failed run may still be present at the \
-                         target -- check and remove it yourself",
-                        display_path(path)
-                    ),
-                )),
-            }
-        }
+        // The descriptor is still open: abort_save unlinks while it is (only
+        // the link to the inode we just created is removed) and closes it
+        // afterwards.
+        Err(stage) => Err(abort_save(&c_path, path, Some(fd), stage)),
         Ok(()) => {
             // All 32 bytes were written and fsynced, but the save is only
             // finished once the close succeeds.
-            if unsafe { libc::close(fd) } != 0 {
-                let e = std::io::Error::last_os_error();
-                if e.raw_os_error() == Some(libc::EINTR) {
-                    // close() released the descriptor despite EINTR.
-                    return Ok(());
-                }
-                // An unrecoverable close error: even if the file happens to
-                // hold 32 bytes with mode 0600, the save did not complete
-                // normally, so this invocation's file must not stay behind
-                // to be mistaken for a successfully saved key. On Linux the
-                // descriptor is released even when close() reports an error,
-                // so close is not retried; remove the file this invocation
-                // created, exactly as for a write or fsync failure.
-                if unsafe { libc::unlink(c_path.as_ptr()) } == 0 {
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "key file '{}' was not saved: closing the key file \
-                             failed: {e}; the file created by this invocation \
-                             has been removed",
-                            display_path(path)
-                        ),
-                    ));
-                }
-                // The system refused to remove this invocation's file.
-                // Report both facts -- the original close failure and the
-                // unfinished cleanup -- so it is clear a key file from this
-                // failed run may still sit at the target. Never work around
-                // the refusal (e.g. by loosening the parent directory's
-                // permissions or renaming the file to another name).
-                let ue = std::io::Error::last_os_error();
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "key file '{}' was not saved: closing the key file \
-                         failed: {e}; cleanup of the incomplete file also \
-                         failed ({ue}): a key file from this failed run may \
-                         still be present at the target",
-                        display_path(path)
-                    ),
-                ));
+            if unsafe { libc::close(fd) } == 0 {
+                return Ok(());
             }
-            Ok(())
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                // close() released the descriptor despite EINTR.
+                return Ok(());
+            }
+            // An unrecoverable close error: even if the file happens to hold
+            // 32 bytes with mode 0600, the save did not complete normally, so
+            // this invocation's file must not stay behind to be mistaken for
+            // a successfully saved key. On Linux the descriptor is released
+            // even when close() reports an error, so close is not retried;
+            // the file is removed exactly as for a write or fsync failure.
+            let stage = std::io::Error::new(
+                e.kind(),
+                format!("closing the key file failed: {e}"),
+            );
+            Err(abort_save(&c_path, path, None, stage))
         }
+    }
+}
+
+/// Abandon a save that could not be completed: remove the file this
+/// invocation created at the target and build the error to report.
+///
+/// `stage` is the original failure (permission setup or confirmation, write,
+/// sync, or close); its kind and message are kept as the reported error, so a
+/// cleanup problem can never mask why the save failed. If `fd` is `Some`, the
+/// descriptor is still open: the unlink runs first and its result is captured
+/// before the close, which may clobber errno (on Linux close releases the
+/// descriptor even when it reports an error, so it is never retried).
+///
+/// The unlink only ever targets the link this invocation created (the caller
+/// opened it O_CREAT | O_EXCL), never an object that predates this run.
+///
+/// * Removal succeeds: nothing of this run remains at the target -- no empty
+///   file, no partial key, no unsynced 32-byte file.
+/// * The system refuses the removal: whatever the file holds (an empty file,
+///   a partial key, or 32 bytes that were never synced), it is not a saved
+///   key. The report keeps the original failure, adds the cleanup failure
+///   and its reason, and says plainly that this run's file may still sit at
+///   the target so the user can check and remove it. It never claims the
+///   file is gone, and the refusal is never worked around -- the parent
+///   directory's permissions are not loosened and the key is not stashed
+///   under another name.
+#[cfg(unix)]
+fn abort_save(
+    c_path: &CString,
+    path: &OsStr,
+    fd: Option<RawFd>,
+    stage: std::io::Error,
+) -> std::io::Error {
+    let unlink_err = if unsafe { libc::unlink(c_path.as_ptr()) } == 0 {
+        None
+    } else {
+        Some(std::io::Error::last_os_error())
+    };
+    if let Some(fd) = fd {
+        unsafe { libc::close(fd) };
+    }
+    let kind = stage.kind();
+    match unlink_err {
+        None => std::io::Error::new(
+            kind,
+            format!(
+                "key file '{}' was not saved: {stage}; the file created by \
+                 this invocation has been removed",
+                display_path(path)
+            ),
+        ),
+        Some(ue) => std::io::Error::new(
+            kind,
+            format!(
+                "key file '{}' was not saved: {stage}; cleanup of the \
+                 incomplete file also failed ({ue}): a file created by this \
+                 failed run may still be present at the target -- check and \
+                 remove it yourself",
+                display_path(path)
+            ),
+        ),
     }
 }
 
