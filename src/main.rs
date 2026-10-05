@@ -163,17 +163,46 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
             ))
         }
         Ok(()) => {
-            // All 32 bytes were written and fsynced, so the file is complete.
+            // All 32 bytes were written and fsynced, but the save is only
+            // finished once the close succeeds.
             if unsafe { libc::close(fd) } != 0 {
                 let e = std::io::Error::last_os_error();
                 if e.raw_os_error() == Some(libc::EINTR) {
                     // close() released the descriptor despite EINTR.
                     return Ok(());
                 }
+                // An unrecoverable close error: even if the file happens to
+                // hold 32 bytes with mode 0600, the save did not complete
+                // normally, so this invocation's file must not stay behind
+                // to be mistaken for a successfully saved key. On Linux the
+                // descriptor is released even when close() reports an error,
+                // so close is not retried; remove the file this invocation
+                // created, exactly as for a write or fsync failure.
+                if unsafe { libc::unlink(c_path.as_ptr()) } == 0 {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "key file '{}' was not saved: closing the key file \
+                             failed: {e}; the file created by this invocation \
+                             has been removed",
+                            display_path(path)
+                        ),
+                    ));
+                }
+                // The system refused to remove this invocation's file.
+                // Report both facts -- the original close failure and the
+                // unfinished cleanup -- so it is clear a key file from this
+                // failed run may still sit at the target. Never work around
+                // the refusal (e.g. by loosening the parent directory's
+                // permissions or renaming the file to another name).
+                let ue = std::io::Error::last_os_error();
                 return Err(std::io::Error::new(
                     e.kind(),
                     format!(
-                        "key file '{}' written but close failed: {e}",
+                        "key file '{}' was not saved: closing the key file \
+                         failed: {e}; cleanup of the incomplete file also \
+                         failed ({ue}): a key file from this failed run may \
+                         still be present at the target",
                         display_path(path)
                     ),
                 ));
