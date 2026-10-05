@@ -13,6 +13,8 @@
  *      WRITE       off=N req=N ret=N [hex=...]   each write() on the key fd;
  *                    ret=-1 errno=ENAME for injected faults
  *      FSYNC       ret=0/-1
+ *      CLOSE       ret=0/-1 [errno=ENAME]   each close() on the key fd
+ *      UNLINK      ret=0/-1 [errno=ENAME]   each unlink() the guest attempts
  *
  *    FIRST_WRITE with mode=0o600 and size=0 proves the program had both set
  *    and *confirmed* 0600 before a single key byte was written. The WRITE
@@ -48,6 +50,17 @@
  *                                        call) and from EINTR/EIO (an error
  *                                        is reported).
  *      WRAPFILE_TEST_FAIL_FSYNC=1       fsync() fails with EIO
+ *      WRAPFILE_TEST_FAIL_CLOSE=1       close() really closes the descriptor
+ *                                        (as Linux does even on error) but
+ *                                        reports failure with EIO -- an
+ *                                        unrecoverable error at the close
+ *                                        stage, after write+fsync succeeded
+ *      WRAPFILE_TEST_CLOSE_EINTR=1      close() really closes the descriptor
+ *                                        but reports EINTR -- the recoverable
+ *                                        interruption that is NOT a failure
+ *      WRAPFILE_TEST_FAIL_UNLINK=1      unlink() is refused with EACCES and
+ *                                        the directory entry is left in
+ *                                        place, so cleanup cannot complete
  *      WRAPFILE_TEST_TRACE_BYTES=1      append hex=... of the bytes each
  *                                        write() actually landed, so tests can
  *                                        reconstruct the byte stream and check
@@ -83,6 +96,8 @@ typedef int (*fstat_fn)(int, struct stat *);
 typedef int (*fstat64_fn)(int, struct stat64 *);
 typedef ssize_t (*write_fn)(int, const void *, size_t);
 typedef int (*fsync_fn)(int);
+typedef int (*close_fn)(int);
+typedef int (*unlink_fn)(const char *);
 
 static open_fn    real_open;
 static open64_fn  real_open64;
@@ -91,6 +106,8 @@ static fstat_fn   real_fstat;
 static fstat64_fn real_fstat64;
 static write_fn   real_write;
 static fsync_fn   real_fsync;
+static close_fn   real_close;
+static unlink_fn  real_unlink;
 
 static int cfg_fail_fchmod = 0;
 static int cfg_fail_fstat  = 0;
@@ -100,6 +117,9 @@ static int  cfg_write_eintr = 0;        /* first N write() calls fail EINTR */
 static long cfg_fail_write_after = -1;  /* -1 = disabled */
 static long cfg_write_zero_after = -1;  /* -1 = disabled */
 static int  cfg_fail_fsync = 0;
+static int  cfg_fail_close = 0;
+static int  cfg_close_eintr = 0;
+static int  cfg_fail_unlink = 0;
 static int  cfg_trace_bytes = 0;
 
 /* Descriptor table: fds the guest created with O_CREAT. */
@@ -156,6 +176,12 @@ static void load_config(void)
         cfg_write_zero_after = strtol(v, NULL, 10);
     if ((v = getenv("WRAPFILE_TEST_FAIL_FSYNC")) && v[0] == '1')
         cfg_fail_fsync = 1;
+    if ((v = getenv("WRAPFILE_TEST_FAIL_CLOSE")) && v[0] == '1')
+        cfg_fail_close = 1;
+    if ((v = getenv("WRAPFILE_TEST_CLOSE_EINTR")) && v[0] == '1')
+        cfg_close_eintr = 1;
+    if ((v = getenv("WRAPFILE_TEST_FAIL_UNLINK")) && v[0] == '1')
+        cfg_fail_unlink = 1;
     if ((v = getenv("WRAPFILE_TEST_TRACE_BYTES")) && v[0] == '1')
         cfg_trace_bytes = 1;
 }
@@ -510,5 +536,58 @@ int fsync(int fd)
     int rc = real_fsync(fd);
     if (is_tracked(fd))
         trace("FSYNC ret=%d\n", rc);
+    return rc;
+}
+
+int close(int fd)
+{
+    if (!real_close)
+        real_close = (close_fn)dlsym(RTLD_NEXT, "close");
+
+    if (!process_active() || !is_tracked(fd))
+        return real_close(fd);
+    load_config();
+
+    /*
+     * The descriptor is really closed first: on Linux close() releases the
+     * fd even when it reports an error, so an injected failure must not
+     * leave the fd open either. Only the return value is a lie.
+     */
+    int rc = real_close(fd);
+    tracked[fd] = 0;
+
+    if (rc == 0 && cfg_fail_close) {
+        trace("CLOSE ret=-1 errno=EIO\n");
+        errno = EIO;
+        return -1;
+    }
+    if (rc == 0 && cfg_close_eintr) {
+        trace("CLOSE ret=-1 errno=EINTR\n");
+        errno = EINTR;
+        return -1;
+    }
+    trace("CLOSE ret=%d\n", rc);
+    return rc;
+}
+
+int unlink(const char *path)
+{
+    if (!real_unlink)
+        real_unlink = (unlink_fn)dlsym(RTLD_NEXT, "unlink");
+
+    if (!process_active())
+        return real_unlink(path);
+    load_config();
+
+    /* The system refuses to remove the entry: nothing is actually
+     * unlinked, so whatever the guest created stays on disk. */
+    if (cfg_fail_unlink) {
+        trace("UNLINK ret=-1 errno=EACCES\n");
+        errno = EACCES;
+        return -1;
+    }
+
+    int rc = real_unlink(path);
+    trace("UNLINK ret=%d\n", rc);
     return rc;
 }

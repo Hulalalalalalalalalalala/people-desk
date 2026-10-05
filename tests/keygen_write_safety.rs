@@ -26,6 +26,16 @@
 //!   explanation naming the target on stderr, empty stdout, and no file
 //!   left at the target: no empty file, no partial key, no zero-padded
 //!   32-byte stand-in.
+//! * Close-stage failure: an unrecoverable close() error after all 32 bytes
+//!   were written and fsynced is still a failed save -- exit 1, empty
+//!   stdout, stderr naming the target and the close-stage error, and the
+//!   file this invocation created is removed, even though it happens to
+//!   hold 32 bytes with mode 0600. If the system also refuses to remove
+//!   the file, stderr keeps the close error AND says the cleanup did not
+//!   complete (the key file may remain at the target); the parent
+//!   directory's permissions are never changed to force the removal.
+//! * A close() that only reports EINTR (the descriptor was released
+//!   anyway) is not a failure: the save is reported as usual with exit 0.
 //!
 //! The faults are injected by the LD_PRELOAD shim (tests/support/permfail),
 //! which also traces every write()/fsync() on the key descriptor so the
@@ -708,4 +718,216 @@ fn zero_byte_write_after_partial_progress_removes_the_partial_file() {
     let run2 = run_keygen(&key, 0o022, &so, &[], &trace2);
     assert_success(&key, &run2);
     sibling.assert_untouched();
+}
+
+#[test]
+fn close_error_after_sync_fails_and_removes_the_file() {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new("close-error");
+    let key = tmp.child("key");
+    let sibling = Sentinel::file(&tmp.path, "sibling", b"do-not-touch", 0o644);
+    let parent_mode_before = mode_of(&tmp.path);
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // All 32 bytes are written and fsynced, but closing the file reports an
+    // unrecoverable I/O error. Even though the file on disk is a complete
+    // 32-byte key with mode 0600, the save did not complete cleanly and
+    // must be treated as a failure.
+    let run = run_keygen(
+        &key,
+        0o022,
+        &so,
+        &[
+            ("WRAPFILE_TEST_FAIL_CLOSE", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+
+    let events = parse_trace(&trace);
+    let writes = successful_writes(&events);
+    // The whole key really was written and synced before the close failed...
+    assert_writes_tile(&writes, KEY_LEN, "writes before close");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "FSYNC" && e.ret() == Some(0)),
+        "the key must have been fsynced before the close stage"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "CLOSE" && e.get("errno") == Some("EIO")),
+        "the unrecoverable close error must have been injected"
+    );
+    // ...so the full key is the material that must not leak.
+    let full_key = reconstruct(&writes);
+    assert_eq!(full_key.len(), KEY_LEN);
+
+    assert_failed_cleanly(&key, &run, &tmp.path, &["sibling", "trace.log"], &full_key);
+    assert_key_material_not_leaked(&run, &full_key, "the closed-over key");
+    // stderr must place the failure at the close stage -- not report a
+    // write/fsync problem, and never read as success.
+    let stderr = String::from_utf8_lossy(&run.err);
+    assert!(
+        stderr.contains("closing the key file failed"),
+        "stderr should say the failure happened while closing the key file, got: {stderr}"
+    );
+    // The cleanup was a plain unlink of the target: it was attempted and
+    // succeeded, and the parent directory was never modified to force it.
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "UNLINK" && e.ret() == Some(0)),
+        "the failed save must unlink the file it created"
+    );
+
+    sibling.assert_untouched();
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_mode_before,
+        "parent directory permissions must be untouched"
+    );
+
+    // The failure was transient: a fault-free retry at the same path saves
+    // a full key (O_EXCL would fail on any leftover).
+    let trace2 = prepare_trace(&tmp.path, "trace2.log");
+    let run2 = run_keygen(&key, 0o022, &so, &[], &trace2);
+    assert_success(&key, &run2);
+    sibling.assert_untouched();
+}
+
+#[test]
+fn close_eintr_after_sync_is_still_a_success() {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new("close-eintr");
+    let key = tmp.child("key");
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // close() releases the descriptor but reports EINTR: on Linux this is
+    // not a failure, and the completed save must be reported as usual.
+    let run = run_keygen(
+        &key,
+        0o022,
+        &so,
+        &[("WRAPFILE_TEST_CLOSE_EINTR", "1")],
+        &trace,
+    );
+
+    assert_success(&key, &run);
+
+    let events = parse_trace(&trace);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "CLOSE" && e.get("errno") == Some("EINTR")),
+        "the EINTR close must have been injected"
+    );
+    assert!(
+        events.iter().all(|e| e.kind != "UNLINK"),
+        "a successful save must never unlink its own key file"
+    );
+}
+
+#[test]
+fn close_error_with_refused_cleanup_reports_both_failures() {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new("close-error-unlink-refused");
+    let key = tmp.child("key");
+    let sibling = Sentinel::file(&tmp.path, "sibling", b"keep-me", 0o600);
+    let parent_mode_before = mode_of(&tmp.path);
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // The close fails, and the system then refuses to remove the file this
+    // invocation created. The command must report both: the original close
+    // failure and the unfinished cleanup -- never just one of them, and
+    // never a claim that nothing was left behind.
+    let run = run_keygen(
+        &key,
+        0o022,
+        &so,
+        &[
+            ("WRAPFILE_TEST_FAIL_CLOSE", "1"),
+            ("WRAPFILE_TEST_FAIL_UNLINK", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+
+    let events = parse_trace(&trace);
+    let writes = successful_writes(&events);
+    assert_writes_tile(&writes, KEY_LEN, "writes before close");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "CLOSE" && e.get("errno") == Some("EIO")),
+        "the unrecoverable close error must have been injected"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "UNLINK" && e.ret() == Some(-1)),
+        "the refused cleanup must have been injected"
+    );
+    let full_key = reconstruct(&writes);
+    assert_eq!(full_key.len(), KEY_LEN);
+
+    assert_eq!(run.rc, 1, "an unsavable key must exit 1");
+    assert!(
+        run.out.is_empty(),
+        "no success message may be printed, got {}",
+        String::from_utf8_lossy(&run.out)
+    );
+    let stderr = String::from_utf8_lossy(&run.err);
+    assert!(
+        stderr.contains(&key.display().to_string()),
+        "stderr should name the target path, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("closing the key file failed"),
+        "stderr must keep the original close failure, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("cleanup also failed") && stderr.contains("may still exist"),
+        "stderr must say the cleanup did not complete and the key file may remain, got: {stderr}"
+    );
+    assert_key_material_not_leaked(&run, &full_key, "the stranded key");
+
+    // The unlink was refused, so the file this invocation created is still
+    // at the target -- exactly as written, not altered or renamed.
+    let meta = fs::metadata(&key).expect("the refused unlink leaves the file behind");
+    assert_eq!(meta.len() as usize, KEY_LEN);
+    assert_eq!(meta.mode() & 0o7777, MODE_0600);
+    assert_eq!(fs::read(&key).unwrap(), full_key);
+    // Nothing else appeared in the directory either: the key was not moved
+    // to a different name to "complete" the cleanup.
+    let mut entries: Vec<String> = fs::read_dir(&tmp.path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec!["key", "sibling", "trace.log"],
+        "no extra file may be created to finish the cleanup"
+    );
+
+    sibling.assert_untouched();
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_mode_before,
+        "parent directory permissions must never be changed to force cleanup"
+    );
 }

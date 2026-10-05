@@ -170,10 +170,36 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
                     // close() released the descriptor despite EINTR.
                     return Ok(());
                 }
+                // An unrecoverable close error means the save did not
+                // complete cleanly, so this follows the same contract as a
+                // write/fsync failure: the file created by this invocation
+                // must not be left behind to be mistaken for a saved key --
+                // even though it happens to hold 32 bytes with mode 0600.
+                // (On Linux the failed close() already released the
+                // descriptor, so only the unlink remains.) Cleanup is a
+                // plain unlink of the target path: the parent directory's
+                // permissions are never changed to force it through, and the
+                // key is never moved to a different name.
+                if unsafe { libc::unlink(c_path.as_ptr()) } == 0 {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "key file '{}' not saved: closing the key file failed: {e}; \
+                             the file from this run was removed",
+                            display_path(path)
+                        ),
+                    ));
+                }
+                // The system refused to remove the file: report both
+                // failures honestly -- the original close error and the
+                // unfinished cleanup -- instead of claiming nothing remains.
+                let ue = std::io::Error::last_os_error();
                 return Err(std::io::Error::new(
                     e.kind(),
                     format!(
-                        "key file '{}' written but close failed: {e}",
+                        "key file '{}' not saved: closing the key file failed: {e}; \
+                         cleanup also failed: {ue}: \
+                         the key file from this run may still exist at that path",
                         display_path(path)
                     ),
                 ));
