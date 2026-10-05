@@ -83,11 +83,91 @@ fn starts_with_dash(arg: &OsStr) -> bool {
     arg.as_encoded_bytes().first() == Some(&b'-')
 }
 
-// Human-readable rendering of a path for messages only. Lossy conversion may
-// replace non-UTF-8 bytes for display, but this string is never used to
-// touch the filesystem -- the original OsStr is always used for that.
-fn display_path(path: &OsStr) -> std::path::Display<'_> {
-    std::path::Path::new(path).display()
+// Human-readable rendering of a path for messages only. The result is never
+// used to touch the filesystem -- the original OsStr is always used for
+// that -- it exists so the user can tell exactly which name a message is
+// about without the name hijacking the terminal.
+//
+// A path that is valid UTF-8 and contains no ASCII control byte, double
+// quote, or backslash is shown verbatim (so the common case is unchanged).
+// Any other path is shown between double quotes with escapes:
+//   \n  \r  \t   newline, carriage return, tab
+//   \"  \\       double quote, backslash
+//   \xhh         any other ASCII control byte, and each raw byte that is not
+//                part of a valid UTF-8 sequence (hh = two lowercase hex
+//                digits)
+// Every other character -- including non-ASCII text such as Chinese -- is
+// kept as-is. No raw ASCII control byte ever reaches the message, so a file
+// name cannot break a result into extra lines, inject terminal control
+// sequences, or imitate another message. Because a real backslash is shown
+// as \\, the escaped text can also never collide with a different file whose
+// name literally contains characters like "\xff" or "\n": two names share a
+// display only if their raw bytes are identical.
+fn display_path(path: &OsStr) -> String {
+    let bytes = path.as_encoded_bytes();
+    let plain = std::str::from_utf8(bytes)
+        .map(|s| !s.bytes().any(needs_escape))
+        .unwrap_or(false);
+    if plain {
+        // Valid UTF-8 without anything to escape: shown exactly as passed.
+        return String::from_utf8(bytes.to_vec()).unwrap();
+    }
+
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x00..=0x1f | 0x7f => push_hex_escape(&mut out, b),
+            0x20..=0x7e => out.push(b as char),
+            _ => match decode_utf8_char(&bytes[i..]) {
+                // A complete, valid multi-byte character: keep it readable.
+                Some((ch, len)) => {
+                    out.push(ch);
+                    i += len - 1;
+                }
+                // A raw byte no valid UTF-8 sequence starts with: show it
+                // byte-for-byte so distinct undecodable names stay distinct.
+                None => push_hex_escape(&mut out, b),
+            },
+        }
+        i += 1;
+    }
+    out.push('"');
+    out
+}
+
+// A byte that forces the quoted/escaped rendering when it appears in an
+// otherwise valid UTF-8 path: ASCII control bytes (including DEL) and the
+// two printable characters the escaping gives a special meaning to.
+fn needs_escape(b: u8) -> bool {
+    b < 0x20 || b == 0x7f || b == b'"' || b == b'\\'
+}
+
+fn push_hex_escape(out: &mut String, b: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push_str("\\x");
+    out.push(HEX[(b >> 4) as usize] as char);
+    out.push(HEX[(b & 0x0f) as usize] as char);
+}
+
+// Decode the single UTF-8 character starting at bytes[0], if a complete and
+// valid one starts there. Returns the character and its length in bytes.
+fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
+    let len = match bytes[0] {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    };
+    let s = std::str::from_utf8(bytes.get(..len)?).ok()?;
+    s.chars().next().map(|ch| (ch, len))
 }
 
 #[cfg(unix)]

@@ -2,23 +2,22 @@
 //! "拒绝覆盖与路径要求" and "参数与状态码").
 //!
 //! The rule protected here: keygen operates on the *raw* path the user
-//! handed to the command. Rendering that path for a message (a lossy
-//! conversion that may replace undecodable bytes) must never decide which
-//! file is created or refused -- the display string is not a filesystem
-//! name.
+//! handed to the command. Rendering that path for a message (the escaped
+//! display form documented in the README) must never decide which file is
+//! created or refused -- the display string is not a filesystem name.
 //!
 //! What is protected here:
 //!
 //! * A legal file name containing non-UTF-8 bytes generates a key normally
 //!   when the parent exists and is writable and the target does not exist:
 //!   exit 0, exactly 32 raw key bytes at the *raw* name, mode 0600, the
-//!   usual save-location line on stdout (undecodable bytes may appear
-//!   replaced there), empty stderr. No extra file whose name contains the
-//!   U+FFFD replacement character is created as a side effect of display
-//!   conversion, and the command does not crash.
-//! * Two names in one directory whose raw bytes differ but whose lossy
-//!   display is identical are distinct targets: existence is judged only
-//!   by the raw path the user passed. The look-alike sibling is never
+//!   usual save-location line on stdout (with the path in its escaped
+//!   display form there), empty stderr. No extra file whose name contains
+//!   the U+FFFD replacement character or the escape text is created as a
+//!   side effect of display conversion, and the command does not crash.
+//! * Two names in one directory whose raw bytes differ (and whose old lossy
+//!   rendering was identical) are distinct targets: existence is judged
+//!   only by the raw path the user passed. The look-alike sibling is never
 //!   treated as the target, overwritten, or re-permissioned. If the raw
 //!   target itself exists, the command exits 1, explains on stderr, prints
 //!   no success message, preserves the existing file's contents and
@@ -57,6 +56,55 @@ fn bin() -> PathBuf {
 
 fn os(raw: &[u8]) -> OsString {
     OsString::from_vec(raw.to_vec())
+}
+
+/// The display form the command must print for `raw`, per the documented
+/// escaping rules: plain UTF-8 without control bytes, '"' or '\' is shown
+/// verbatim; anything else is double-quoted with \n \r \t \" \\ and \xhh
+/// escapes (raw undecodable bytes shown individually as \xhh).
+fn expected_display(raw: &[u8]) -> String {
+    let plain = std::str::from_utf8(raw)
+        .map(|s| !s.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\'))
+        .unwrap_or(false);
+    if plain {
+        return String::from_utf8(raw.to_vec()).unwrap();
+    }
+    let mut out = String::from("\"");
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        match b {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x00..=0x1f | 0x7f => out.push_str(&format!("\\x{b:02x}")),
+            0x20..=0x7e => out.push(b as char),
+            _ => {
+                let len = match b {
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => 0,
+                };
+                let decoded = raw
+                    .get(i..i + len)
+                    .and_then(|slice| std::str::from_utf8(slice).ok())
+                    .filter(|s| !s.is_empty());
+                match decoded {
+                    Some(s) => {
+                        out.push_str(s);
+                        i += len - 1;
+                    }
+                    None => out.push_str(&format!("\\x{b:02x}")),
+                }
+            }
+        }
+        i += 1;
+    }
+    out.push('"');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -146,8 +194,8 @@ fn assert_no_display_artifact(dir: &Path) {
 
 /// The success contract for a target passed as the bare name `raw_name`
 /// inside `dir`: exit 0, empty stderr, only the save-location line on
-/// stdout (lossy display allowed there), and exactly 32 raw key bytes in a
-/// 0600 file at the *raw* name.
+/// stdout (with the path in its escaped display form), and exactly 32 raw
+/// key bytes in a 0600 file at the *raw* name.
 fn assert_key_generated(dir: &Path, raw_name: &[u8], run: &Run) -> Vec<u8> {
     assert_eq!(run.rc, 0, "stderr={}", String::from_utf8_lossy(&run.err));
     assert!(
@@ -157,7 +205,7 @@ fn assert_key_generated(dir: &Path, raw_name: &[u8], run: &Run) -> Vec<u8> {
     );
 
     let raw = os(raw_name);
-    let expected_out = format!("Key saved to {}\n", Path::new(&raw).display()).into_bytes();
+    let expected_out = format!("Key saved to {}\n", expected_display(raw_name)).into_bytes();
     assert_eq!(
         run.out, expected_out,
         "stdout must be exactly the save-location message for the raw path"
@@ -234,14 +282,20 @@ fn non_utf8_name_generates_key_at_the_raw_path() {
 #[test]
 fn confusable_display_names_are_distinct_targets() {
     let tmp = Tmp::new("confusable");
-    // Different raw bytes, identical lossy display ("key-�"): the premise
-    // of the confusion this test guards against.
+    // Different raw bytes that the old lossy rendering conflated ("key-�"):
+    // the premise of the confusion this test guards against. The escaped
+    // display form keeps them visibly distinct.
     let existing: &[u8] = b"key-\xff";
     let target: &[u8] = b"key-\xfe";
     assert_eq!(
         Path::new(&os(existing)).display().to_string(),
         Path::new(&os(target)).display().to_string(),
-        "test premise: both names must render identically"
+        "test premise: both names must render identically under lossy display"
+    );
+    assert_ne!(
+        expected_display(existing),
+        expected_display(target),
+        "the escaped display form must keep the two names distinguishable"
     );
 
     let lookalike = Sentinel::file(&tmp.path, existing, b"not-the-target", 0o640);
@@ -268,7 +322,7 @@ fn existing_raw_target_fails_despite_confusable_sibling() {
     assert_eq!(
         Path::new(&os(existing)).display().to_string(),
         Path::new(&os(lookalike)).display().to_string(),
-        "test premise: both names must render identically"
+        "test premise: both names must render identically under lossy display"
     );
 
     // Both the raw target and its display-twin exist on disk.
@@ -285,8 +339,8 @@ fn existing_raw_target_fails_despite_confusable_sibling() {
     assert!(!run.err.is_empty(), "stderr must explain the failure");
     let stderr = String::from_utf8_lossy(&run.err);
     assert!(
-        stderr.contains(&Path::new(&os(existing)).display().to_string()),
-        "stderr should name the refused target, got: {stderr}"
+        stderr.contains(&expected_display(existing)),
+        "stderr should name the refused target in its escaped display form, got: {stderr}"
     );
 
     // The existing file keeps its contents and permissions, the sibling is
