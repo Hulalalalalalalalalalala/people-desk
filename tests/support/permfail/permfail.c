@@ -38,6 +38,13 @@
  *                                        write() fails with EIO (the last
  *                                        partial write is clamped so exactly
  *                                        N bytes are on disk before the error)
+ *      WRAPFILE_TEST_ZERO_WRITE_AFTER=N after N bytes in total have landed,
+ *                                        write() accepts 0 bytes and reports
+ *                                        no error (ret=0, errno cleared): a
+ *                                        write that makes no progress -- not
+ *                                        completion and not EINTR; the last
+ *                                        partial write is clamped so exactly
+ *                                        N bytes are on disk first
  *      WRAPFILE_TEST_FAIL_FSYNC=1       fsync() fails with EIO
  *      WRAPFILE_TEST_TRACE_BYTES=1      append hex=... of the bytes each
  *                                        write() actually landed, so tests can
@@ -89,6 +96,7 @@ static int cfg_lie_mode    = -1; /* -1 = disabled */
 static long cfg_partial_write = 0;      /* 0 = disabled */
 static int  cfg_write_eintr = 0;        /* first N write() calls fail EINTR */
 static long cfg_fail_write_after = -1;  /* -1 = disabled */
+static long cfg_zero_write_after = -1;  /* -1 = disabled: ret=0, no errno */
 static int  cfg_fail_fsync = 0;
 static int  cfg_trace_bytes = 0;
 
@@ -142,6 +150,8 @@ static void load_config(void)
         cfg_write_eintr = atoi(v);
     if ((v = getenv("WRAPFILE_TEST_FAIL_WRITE_AFTER")) && v[0] != '\0')
         cfg_fail_write_after = strtol(v, NULL, 10);
+    if ((v = getenv("WRAPFILE_TEST_ZERO_WRITE_AFTER")) && v[0] != '\0')
+        cfg_zero_write_after = strtol(v, NULL, 10);
     if ((v = getenv("WRAPFILE_TEST_FAIL_FSYNC")) && v[0] == '1')
         cfg_fail_fsync = 1;
     if ((v = getenv("WRAPFILE_TEST_TRACE_BYTES")) && v[0] == '1')
@@ -409,6 +419,26 @@ ssize_t write(int fd, const void *buf, size_t count)
             errno = EIO;
             return -1;
         }
+        if (allowed > (size_t)remaining)
+            allowed = (size_t)remaining;
+    }
+
+    /*
+     * A write that makes no progress: once N bytes have landed, the next
+     * write() returns 0 with errno cleared -- neither completion nor an
+     * error the caller could retry. The clamp above the EIO block guarantees
+     * exactly N bytes are on disk when this fires.
+     */
+    if (cfg_zero_write_after >= 0 &&
+        (long long)written_total[fd] >= cfg_zero_write_after) {
+        trace("WRITE off=%llu req=%zu ret=0 errno=ZERO\n",
+              written_total[fd], allowed);
+        errno = 0;
+        return 0;
+    }
+    if (cfg_zero_write_after >= 0) {
+        long long remaining =
+            (long long)cfg_zero_write_after - (long long)written_total[fd];
         if (allowed > (size_t)remaining)
             allowed = (size_t)remaining;
     }

@@ -11,6 +11,14 @@
 //!   32 raw key bytes (no newline, header, or trailer), mode 0600.
 //! * Recoverable interruption: write() failing with EINTR and then
 //!   succeeding still completes the same generation with exit code 0.
+//! * Write that makes no progress: bytes are still pending but write()
+//!   returns 0 without reporting an error. This is neither completion nor a
+//!   recoverable interruption: exit 1 (not a hang, not a retry loop), stderr
+//!   explains the incomplete save (naming the target), stdout is empty, and
+//!   the file this invocation created is unlinked -- an empty file after a
+//!   first zero-length write, or the partial key (never a zero-padded 32
+//!   bytes) after one mid-save. Covered both before any byte landed and
+//!   after exactly 10 bytes.
 //! * Success is only reported after every byte is written *and* fsynced:
 //!   exit 0, the usual "Key saved to ..." line on stdout, empty stderr.
 //! * Unrecoverable write error after some bytes landed, and fsync failure
@@ -277,8 +285,9 @@ fn assert_failed_cleanly(
         "stderr should name the target path, got: {stderr}"
     );
     assert!(
-        !contains_slice(&run.out, leaked_candidate)
-            && !contains_slice(&run.err, leaked_candidate),
+        leaked_candidate.is_empty()
+            || (!contains_slice(&run.out, leaked_candidate)
+                && !contains_slice(&run.err, leaked_candidate)),
         "key material must never leak to stdout/stderr, even on failure"
     );
 
@@ -526,4 +535,131 @@ fn fsync_failure_after_full_write_fails_and_removes_the_file() {
         parent_mode_before,
         "parent directory permissions must be untouched"
     );
+}
+
+/// Shared body for the "write accepted 0 bytes without an error" cases.
+/// `landed` is the number of key bytes already saved when the first
+/// no-progress write happens: 0 for a freshly created, still-empty file,
+/// 10 for a mid-save file.
+fn zero_progress_write_fails_and_is_cleaned_up(landed: usize, label: &str) {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new(label);
+    let key = tmp.child("key");
+    let sibling = Sentinel::file(&tmp.path, "sibling", b"leave-me-here", 0o640);
+    let parent_mode_before = mode_of(&tmp.path);
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // Four bytes per call, so for landed=10 the bytes on disk are 4+4+2.
+    // Once `landed` bytes have landed, the next write() returns 0 with errno
+    // cleared: no error reported, no progress made.
+    let run = run_keygen(
+        &key,
+        0o022,
+        &so,
+        &[
+            ("WRAPFILE_TEST_PARTIAL_WRITE", "4"),
+            ("WRAPFILE_TEST_ZERO_WRITE_AFTER", &landed.to_string()),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+
+    let events = parse_trace(&trace);
+    let writes = successful_writes(&events);
+    if landed == 0 {
+        assert!(writes.is_empty(), "no key byte may have landed");
+    } else {
+        assert_writes_tile(&writes, landed, "writes before the zero-progress call");
+    }
+    let landed_key = reconstruct(&writes);
+
+    // Exactly one no-progress write, with no errno attached, at the expected
+    // offset; the program must not retry it in a loop or treat it as EINTR.
+    let zero_writes: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == "WRITE" && e.ret() == Some(0))
+        .collect();
+    assert_eq!(zero_writes.len(), 1, "exactly one zero-length write is expected");
+    let zero = zero_writes[0];
+    assert_eq!(
+        zero.off(),
+        Some(landed as u64),
+        "the zero-progress write must happen after exactly {landed} bytes"
+    );
+    assert_eq!(zero.get("errno"), Some("ZERO"), "the shim reports no system error");
+    assert!(
+        events.iter().all(|e| e.kind != "FSYNC"),
+        "an incomplete key must never be synced as if complete"
+    );
+    // Permissions were still set and confirmed before the first byte (or the
+    // first attempt at one).
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "FIRST_WRITE" && e.get("mode") == Some("00600")
+                && e.get("size") == Some("0")),
+        "0600 must be confirmed on the empty file before writing"
+    );
+
+    assert_failed_cleanly(&key, &run, &tmp.path, &["sibling", "trace.log"], &landed_key);
+
+    // The message must read as a save failure naming the target, not as an
+    // argument-usage error and not as success -- without pinning any
+    // OS-supplied wording.
+    let stderr = String::from_utf8_lossy(&run.err);
+    assert!(
+        stderr.contains("incomplete"),
+        "stderr should explain the save was incomplete, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Usage"),
+        "a save failure must not be reported as a usage error, got: {stderr}"
+    );
+
+    // The landed fragment must not appear in either text encoding either.
+    let hex_lower = landed_key
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let hex_upper = hex_lower.to_uppercase();
+    assert!(
+        landed_key.is_empty()
+            || (!contains_slice(&run.err, hex_lower.as_bytes())
+                && !contains_slice(&run.err, hex_upper.as_bytes())),
+        "landed key fragment must not appear hex-encoded on stderr"
+    );
+
+    // Non-existence covers all three forbidden leftovers: an empty file, the
+    // partial fragment, or a 32-byte zero-padded fill-in.
+    assert!(
+        matches!(fs::symlink_metadata(&key), Err(_)),
+        "no filesystem object of any kind may remain at the target"
+    );
+    sibling.assert_untouched();
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_mode_before,
+        "parent directory permissions must be untouched"
+    );
+
+    // The fault was transient: a retry on the now-absent path saves a full
+    // key and leaves the sibling alone.
+    let trace2 = prepare_trace(&tmp.path, "trace2.log");
+    let run2 = run_keygen(&key, 0o022, &so, &[], &trace2);
+    assert_success(&key, &run2);
+    sibling.assert_untouched();
+}
+
+#[test]
+fn zero_progress_write_before_any_byte_fails_and_leaves_nothing() {
+    zero_progress_write_fails_and_is_cleaned_up(0, "zero-at-start");
+}
+
+#[test]
+fn zero_progress_write_after_ten_bytes_fails_and_leaves_nothing() {
+    zero_progress_write_fails_and_is_cleaned_up(10, "zero-at-10");
 }
