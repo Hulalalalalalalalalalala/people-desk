@@ -19,6 +19,13 @@
 //!   this invocation is removed, and neither the parent directory's
 //!   permissions nor pre-existing siblings are touched. Key bytes never
 //!   appear on stdout/stderr, on success or on failure.
+//! * Zero-byte write: write() accepting 0 bytes while bytes remain -- no
+//!   progress, yet no errno either -- is neither success nor a recoverable
+//!   interruption. Whether it happens before any byte landed or midway,
+//!   the command must end (not hang in the save loop) with exit 1, an
+//!   explanation naming the target on stderr, empty stdout, and no file
+//!   left at the target: no empty file, no partial key, no zero-padded
+//!   32-byte stand-in.
 //!
 //! The faults are injected by the LD_PRELOAD shim (tests/support/permfail),
 //! which also traces every write()/fsync() on the key descriptor so the
@@ -208,6 +215,22 @@ fn reconstruct(writes: &[(u64, u64, Option<Vec<u8>>)]) -> Vec<u8> {
         .collect()
 }
 
+/// The write() calls that accepted 0 bytes while reporting no error.
+fn zero_writes<'a>(events: &'a [Event]) -> Vec<&'a Event> {
+    events
+        .iter()
+        .filter(|e| e.kind == "WRITE" && e.ret() == Some(0))
+        .collect()
+}
+
+/// Bytes the program handed to write() calls that accepted none of them.
+fn rejected_offerings(events: &[Event]) -> Vec<u8> {
+    zero_writes(events)
+        .iter()
+        .flat_map(|e| e.hex_bytes().expect("TRACE_BYTES must be on"))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // filesystem assertions
 // ---------------------------------------------------------------------------
@@ -293,6 +316,22 @@ fn assert_failed_cleanly(
         .collect();
     leftovers.sort();
     assert!(leftovers.is_empty(), "unexpected leftover files: {leftovers:?}");
+}
+
+/// Key material must not surface on stdout/stderr in any encoding: not as
+/// raw bytes, and not as a hex (or other text) rendering.
+fn assert_key_material_not_leaked(run: &Run, material: &[u8], what: &str) {
+    assert!(
+        !contains_slice(&run.out, material) && !contains_slice(&run.err, material),
+        "{what} must never appear on stdout/stderr as raw bytes"
+    );
+    let hex: String = material.iter().map(|b| format!("{b:02x}")).collect();
+    let out = String::from_utf8_lossy(&run.out);
+    let err = String::from_utf8_lossy(&run.err);
+    assert!(
+        !out.contains(&hex) && !err.contains(&hex),
+        "{what} must never appear on stdout/stderr in hex form"
+    );
 }
 
 // A pre-existing object that must survive a failed keygen byte-for-byte.
@@ -526,4 +565,147 @@ fn fsync_failure_after_full_write_fails_and_removes_the_file() {
         parent_mode_before,
         "parent directory permissions must be untouched"
     );
+}
+
+#[test]
+fn zero_byte_write_before_any_progress_fails_and_leaves_no_file() {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new("write-zero-start");
+    let key = tmp.child("key");
+    let sibling = Sentinel::file(&tmp.path, "sibling", b"do-not-touch", 0o644);
+    let parent_mode_before = mode_of(&tmp.path);
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // The very first write() accepts 0 bytes and reports no error. This is
+    // not a partial write (nothing advances) and not an interruption (no
+    // errno): the command must give up, not loop inside the save.
+    let run = run_keygen(
+        &key,
+        0o022,
+        &so,
+        &[
+            ("WRAPFILE_TEST_WRITE_ZERO_AFTER", "0"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+
+    let events = parse_trace(&trace);
+    // No byte ever landed...
+    assert!(
+        successful_writes(&events).is_empty(),
+        "no key byte may be written when write() accepts nothing"
+    );
+    // ...and the zero-acceptance really was injected (this run is not a
+    // pass because the fault never triggered).
+    assert!(
+        !zero_writes(&events).is_empty(),
+        "the zero-byte write must have been injected"
+    );
+    assert!(
+        events.iter().all(|e| e.kind != "FSYNC"),
+        "a key that was never written must never be synced as if complete"
+    );
+    // The whole key was offered and rejected; it is the material that must
+    // not leak.
+    let full_key = rejected_offerings(&events);
+    assert_eq!(full_key.len(), KEY_LEN);
+
+    assert_failed_cleanly(&key, &run, &tmp.path, &["sibling", "trace.log"], &full_key);
+    assert_key_material_not_leaked(&run, &full_key, "the rejected key");
+    // stderr must say the save could not be completed -- not a usage error,
+    // and not anything that reads as success.
+    let stderr = String::from_utf8_lossy(&run.err);
+    assert!(
+        stderr.contains("incomplete write"),
+        "stderr should explain the key file was not fully written, got: {stderr}"
+    );
+
+    sibling.assert_untouched();
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_mode_before,
+        "parent directory permissions must be untouched"
+    );
+
+    // Nothing was left behind -- not even an empty file: a fault-free retry
+    // at the same path succeeds (O_EXCL would fail on any leftover).
+    let trace2 = prepare_trace(&tmp.path, "trace2.log");
+    let run2 = run_keygen(&key, 0o022, &so, &[], &trace2);
+    assert_success(&key, &run2);
+    sibling.assert_untouched();
+}
+
+#[test]
+fn zero_byte_write_after_partial_progress_removes_the_partial_file() {
+    let Some(so) = permfail_so() else {
+        eprintln!("skipping: permfail shim not available on this target");
+        return;
+    };
+
+    let tmp = Tmp::new("write-zero-midway");
+    let key = tmp.child("key");
+    let sibling = Sentinel::file(&tmp.path, "sibling", b"keep-me", 0o600);
+    let parent_mode_before = mode_of(&tmp.path);
+    let trace = prepare_trace(&tmp.path, "trace.log");
+
+    // Ten bytes land, then write() accepts 0 bytes without an error.
+    let run = run_keygen(
+        &key,
+        0o022,
+        &so,
+        &[
+            ("WRAPFILE_TEST_WRITE_ZERO_AFTER", "10"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+
+    let events = parse_trace(&trace);
+    let writes = successful_writes(&events);
+    // The stall really happened mid-save: part of the key was on disk.
+    assert_writes_tile(&writes, 10, "writes before the zero-byte write");
+    assert!(
+        !zero_writes(&events).is_empty(),
+        "the zero-byte write must have been injected"
+    );
+    assert!(
+        events.iter().all(|e| e.kind != "FSYNC"),
+        "an incomplete key must never be synced as if complete"
+    );
+    let partial_key = reconstruct(&writes);
+    assert_eq!(partial_key.len(), 10);
+    // Landed prefix + rejected remainder reconstruct the full key.
+    let mut full_key = partial_key.clone();
+    full_key.extend(rejected_offerings(&events));
+    assert_eq!(full_key.len(), KEY_LEN);
+
+    assert_failed_cleanly(&key, &run, &tmp.path, &["sibling", "trace.log"], &full_key);
+    // Neither the full key nor the 10-byte fragment that briefly sat on
+    // disk may leak, as raw bytes or in hex.
+    assert_key_material_not_leaked(&run, &full_key, "the rejected key");
+    assert_key_material_not_leaked(&run, &partial_key, "the saved key fragment");
+    let stderr = String::from_utf8_lossy(&run.err);
+    assert!(
+        stderr.contains("incomplete write"),
+        "stderr should explain the key file was not fully written, got: {stderr}"
+    );
+
+    sibling.assert_untouched();
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_mode_before,
+        "parent directory permissions must be untouched"
+    );
+
+    // The 10-byte partial file was removed (not zero-padded to 32 bytes,
+    // not left behind): a fault-free retry at the same path succeeds.
+    let trace2 = prepare_trace(&tmp.path, "trace2.log");
+    let run2 = run_keygen(&key, 0o022, &so, &[], &trace2);
+    assert_success(&key, &run2);
+    sibling.assert_untouched();
 }

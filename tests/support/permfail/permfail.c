@@ -38,6 +38,15 @@
  *                                        write() fails with EIO (the last
  *                                        partial write is clamped so exactly
  *                                        N bytes are on disk before the error)
+ *      WRAPFILE_TEST_WRITE_ZERO_AFTER=N once N bytes in total have landed,
+ *                                        write() returns 0 without setting
+ *                                        errno: no progress, yet no error
+ *                                        either (the last real write is
+ *                                        clamped so exactly N bytes are on
+ *                                        disk first). Distinct from
+ *                                        PARTIAL_WRITE (some progress every
+ *                                        call) and from EINTR/EIO (an error
+ *                                        is reported).
  *      WRAPFILE_TEST_FAIL_FSYNC=1       fsync() fails with EIO
  *      WRAPFILE_TEST_TRACE_BYTES=1      append hex=... of the bytes each
  *                                        write() actually landed, so tests can
@@ -89,6 +98,7 @@ static int cfg_lie_mode    = -1; /* -1 = disabled */
 static long cfg_partial_write = 0;      /* 0 = disabled */
 static int  cfg_write_eintr = 0;        /* first N write() calls fail EINTR */
 static long cfg_fail_write_after = -1;  /* -1 = disabled */
+static long cfg_write_zero_after = -1;  /* -1 = disabled */
 static int  cfg_fail_fsync = 0;
 static int  cfg_trace_bytes = 0;
 
@@ -142,6 +152,8 @@ static void load_config(void)
         cfg_write_eintr = atoi(v);
     if ((v = getenv("WRAPFILE_TEST_FAIL_WRITE_AFTER")) && v[0] != '\0')
         cfg_fail_write_after = strtol(v, NULL, 10);
+    if ((v = getenv("WRAPFILE_TEST_WRITE_ZERO_AFTER")) && v[0] != '\0')
+        cfg_write_zero_after = strtol(v, NULL, 10);
     if ((v = getenv("WRAPFILE_TEST_FAIL_FSYNC")) && v[0] == '1')
         cfg_fail_fsync = 1;
     if ((v = getenv("WRAPFILE_TEST_TRACE_BYTES")) && v[0] == '1')
@@ -193,6 +205,21 @@ static fstat_fn get_real_fstat(void)
 static int is_tracked(int fd)
 {
     return fd >= 0 && fd < FD_MAX && tracked[fd];
+}
+
+/* malloc'd lowercase hex of n bytes, or NULL. Caller frees. */
+static char *hex_encode(const unsigned char *p, size_t n)
+{
+    static const char digits[] = "0123456789abcdef";
+    char *hex = malloc(n * 2 + 1);
+    if (!hex)
+        return NULL;
+    for (size_t i = 0; i < n; i++) {
+        hex[i * 2] = digits[p[i] >> 4];
+        hex[i * 2 + 1] = digits[p[i] & 0xf];
+    }
+    hex[n * 2] = '\0';
+    return hex;
 }
 
 static void note_created(int fd)
@@ -413,20 +440,42 @@ ssize_t write(int fd, const void *buf, size_t count)
             allowed = (size_t)remaining;
     }
 
+    /* No progress and no error: once N bytes have landed, write() accepts
+     * 0 bytes and reports success-with-zero -- neither a partial write
+     * (which still advances) nor a recoverable interruption (which reports
+     * EINTR). The offered bytes are traced (when TRACE_BYTES is on) so the
+     * test can verify the rejected key material never leaks. */
+    if (cfg_write_zero_after >= 0) {
+        long long remaining =
+            (long long)cfg_write_zero_after - (long long)written_total[fd];
+        if (remaining <= 0) {
+            if (cfg_trace_bytes) {
+                char *hex = hex_encode(buf, allowed);
+                if (hex) {
+                    trace("WRITE off=%llu req=%zu ret=0 hex=%s\n",
+                          written_total[fd], allowed, hex);
+                    free(hex);
+                } else {
+                    trace("WRITE off=%llu req=%zu ret=0\n",
+                          written_total[fd], allowed);
+                }
+            } else {
+                trace("WRITE off=%llu req=%zu ret=0\n",
+                      written_total[fd], allowed);
+            }
+            return 0;
+        }
+        if (allowed > (size_t)remaining)
+            allowed = (size_t)remaining;
+    }
+
     ssize_t r = real_write(fd, buf, allowed);
     if (r > 0) {
         unsigned long long off = written_total[fd];
         written_total[fd] += (unsigned long long)r;
         if (cfg_trace_bytes) {
-            char *hex = malloc((size_t)r * 2 + 1);
+            char *hex = hex_encode(buf, (size_t)r);
             if (hex) {
-                static const char digits[] = "0123456789abcdef";
-                const unsigned char *p = buf;
-                for (ssize_t i = 0; i < r; i++) {
-                    hex[i * 2] = digits[p[i] >> 4];
-                    hex[i * 2 + 1] = digits[p[i] & 0xf];
-                }
-                hex[r * 2] = '\0';
                 trace("WRITE off=%llu req=%zu ret=%zd hex=%s\n",
                       off, allowed, r, hex);
                 free(hex);
