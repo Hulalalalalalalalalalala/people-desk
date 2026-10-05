@@ -13,15 +13,30 @@
  *      WRITE       off=N req=N ret=N [hex=...]   each write() on the key fd;
  *                    ret=-1 errno=ENAME for injected faults
  *      FSYNC       ret=0/-1
+ *      GETRANDOM   off=N req=N ret=N [hex=...]   each getrandom(2) call used
+ *                    to draw key bytes (off = total bytes obtained so far);
+ *                    ret=-1 errno=ENAME for injected faults
  *
  *    FIRST_WRITE with mode=0o600 and size=0 proves the program had both set
  *    and *confirmed* 0600 before a single key byte was written. The WRITE
  *    stream (off ascending from 0 with no gaps or overlaps, ending at 32)
  *    proves partial writes were resumed without duplicating or dropping
  *    bytes, and FSYNC ret=0 after the last WRITE proves the key was synced
- *    to disk before the program reported success.
+ *    to disk before the program reported success. The GETRANDOM stream lets
+ *    the random-source tests distinguish "some bytes obtained, then an
+ *    unrecoverable error" from "short/interrupted reads that simply need
+ *    retrying", and checks that random bytes are obtained *before* the key
+ *    file exists (GETRANDOM precedes OPEN).
  *
- * 2. Fault injection (only for a descriptor the guest itself created):
+ *    NOTE: tracing/faulting getrandom(2) only works when the guest's random
+ *    library calls go through libc. On Linux the checked-in .cargo/config.toml
+ *    selects getrandom's `linux_getrandom` backend for test builds; its
+ *    default `linux_raw` backend issues the syscall via inline assembly and
+ *    cannot be interposed.
+ *
+ * 2. Fault injection. The file knobs apply only to a descriptor the guest
+ *    itself created; the getrandom(2) knobs apply to the guest's random
+ *    draws (a single 32-byte draw per keygen run):
  *      WRAPFILE_TEST_FAIL_FCHMOD=1      fchmod() fails with EPERM
  *      WRAPFILE_TEST_FAIL_FSTAT=1       fstat()/fstat64() fail (EBADF), so the
  *                                        resulting mode cannot be confirmed
@@ -39,10 +54,21 @@
  *                                        partial write is clamped so exactly
  *                                        N bytes are on disk before the error)
  *      WRAPFILE_TEST_FAIL_FSYNC=1       fsync() fails with EIO
+ *      WRAPFILE_TEST_RAND_PARTIAL=N     getrandom(2) returns at most N bytes
+ *                                        per call -- a short read the guest
+ *                                        must keep retrying, never a failure
+ *      WRAPFILE_TEST_RAND_EINTR=N       the first N getrandom(2) calls fail
+ *                                        with EINTR before returning any byte
+ *      WRAPFILE_TEST_RAND_FAIL_AFTER=N  after N random bytes in total have
+ *                                        been obtained getrandom(2) fails with
+ *                                        EIO (the last call is clamped so
+ *                                        exactly N bytes are obtained first);
+ *                                        N=0 fails before any byte is drawn
  *      WRAPFILE_TEST_TRACE_BYTES=1      append hex=... of the bytes each
- *                                        write() actually landed, so tests can
- *                                        reconstruct the byte stream and check
- *                                        nothing secret leaks to stdout/stderr
+ *                                        write()/getrandom() actually
+ *                                        produced, so tests can reconstruct
+ *                                        the byte stream and check nothing
+ *                                        secret leaks to stdout/stderr
  *
  * The shim only activates inside an executable whose basename starts with
  * "wrapfile" (checked via /proc/self/exe), so a wrapper shell used to set
@@ -74,6 +100,7 @@ typedef int (*fstat_fn)(int, struct stat *);
 typedef int (*fstat64_fn)(int, struct stat64 *);
 typedef ssize_t (*write_fn)(int, const void *, size_t);
 typedef int (*fsync_fn)(int);
+typedef ssize_t (*getrandom_fn)(void *, size_t, unsigned int);
 
 static open_fn    real_open;
 static open64_fn  real_open64;
@@ -82,6 +109,7 @@ static fstat_fn   real_fstat;
 static fstat64_fn real_fstat64;
 static write_fn   real_write;
 static fsync_fn   real_fsync;
+static getrandom_fn real_getrandom;
 
 static int cfg_fail_fchmod = 0;
 static int cfg_fail_fstat  = 0;
@@ -90,6 +118,10 @@ static long cfg_partial_write = 0;      /* 0 = disabled */
 static int  cfg_write_eintr = 0;        /* first N write() calls fail EINTR */
 static long cfg_fail_write_after = -1;  /* -1 = disabled */
 static int  cfg_fail_fsync = 0;
+static long cfg_rand_partial = 0;       /* 0 = disabled */
+static int  cfg_rand_eintr_left = 0;    /* first N getrandom() calls fail EINTR */
+static long cfg_rand_fail_after = -1;   /* -1 = disabled */
+static unsigned long long rand_total;   /* random bytes obtained in this process */
 static int  cfg_trace_bytes = 0;
 
 /* Descriptor table: fds the guest created with O_CREAT. */
@@ -144,6 +176,14 @@ static void load_config(void)
         cfg_fail_write_after = strtol(v, NULL, 10);
     if ((v = getenv("WRAPFILE_TEST_FAIL_FSYNC")) && v[0] == '1')
         cfg_fail_fsync = 1;
+    if ((v = getenv("WRAPFILE_TEST_RAND_PARTIAL")) && v[0] != '\0')
+        cfg_rand_partial = strtol(v, NULL, 10);
+    if ((v = getenv("WRAPFILE_TEST_RAND_EINTR")) && v[0] != '\0') {
+        int n = atoi(v);
+        cfg_rand_eintr_left = (n > 0 && n < 256) ? n : 0;
+    }
+    if ((v = getenv("WRAPFILE_TEST_RAND_FAIL_AFTER")) && v[0] != '\0')
+        cfg_rand_fail_after = strtol(v, NULL, 10);
     if ((v = getenv("WRAPFILE_TEST_TRACE_BYTES")) && v[0] == '1')
         cfg_trace_bytes = 1;
 }
@@ -462,4 +502,93 @@ int fsync(int fd)
     if (is_tracked(fd))
         trace("FSYNC ret=%d\n", rc);
     return rc;
+}
+
+/*
+ * Interposition for getrandom(2), used to make the OS CSPRNG fail or stall
+ * deterministically. Unlike the file-descriptor knobs this is not fd-scoped:
+ * a keygen run performs exactly one 32-byte random draw, so the per-process
+ * rand_total counter is sufficient. The guest's getrandom crate calls here
+ * via glibc only when built with the linux_getrandom backend (see
+ * .cargo/config.toml); the default linux_raw backend uses inline syscalls.
+ */
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags)
+{
+    if (!real_getrandom)
+        real_getrandom = (getrandom_fn)dlsym(RTLD_NEXT, "getrandom");
+
+    if (!process_active()) {
+        /*
+         * Outside the wrapfile executable never alter behaviour. A glibc
+         * old enough to lack the wrapper (pre-2.25) is covered by the raw
+         * syscall.
+         */
+        if (real_getrandom)
+            return real_getrandom(buf, buflen, flags);
+        return (ssize_t)syscall(SYS_getrandom, buf, buflen, flags);
+    }
+    load_config();
+
+    /* A recoverable interruption: no byte produced, the guest must retry. */
+    if (cfg_rand_eintr_left > 0) {
+        cfg_rand_eintr_left--;
+        trace("GETRANDOM off=%llu req=%zu ret=-1 errno=EINTR\n",
+              rand_total, buflen);
+        errno = EINTR;
+        return -1;
+    }
+
+    /* A short read: only part of the buffer is filled -- still success. */
+    size_t allowed = buflen;
+    if (cfg_rand_partial > 0 && allowed > (size_t)cfg_rand_partial)
+        allowed = (size_t)cfg_rand_partial;
+
+    /* An unrecoverable error once N random bytes have been obtained. */
+    if (cfg_rand_fail_after >= 0) {
+        long long remaining =
+            (long long)cfg_rand_fail_after - (long long)rand_total;
+        if (remaining <= 0) {
+            trace("GETRANDOM off=%llu req=%zu ret=-1 errno=EIO\n",
+                  rand_total, buflen);
+            errno = EIO;
+            return -1;
+        }
+        if (allowed > (size_t)remaining)
+            allowed = (size_t)remaining;
+    }
+
+    ssize_t r;
+    if (real_getrandom)
+        r = real_getrandom(buf, allowed, flags);
+    else
+        r = (ssize_t)syscall(SYS_getrandom, buf, allowed, flags);
+
+    if (r > 0) {
+        unsigned long long off = rand_total;
+        rand_total += (unsigned long long)r;
+        if (cfg_trace_bytes) {
+            char *hex = malloc((size_t)r * 2 + 1);
+            if (hex) {
+                static const char digits[] = "0123456789abcdef";
+                const unsigned char *p = buf;
+                for (ssize_t i = 0; i < r; i++) {
+                    hex[i * 2] = digits[p[i] >> 4];
+                    hex[i * 2 + 1] = digits[p[i] & 0xf];
+                }
+                hex[r * 2] = '\0';
+                trace("GETRANDOM off=%llu req=%zu ret=%zd hex=%s\n",
+                      off, allowed, r, hex);
+                free(hex);
+            } else {
+                trace("GETRANDOM off=%llu req=%zu ret=%zd\n",
+                      off, allowed, r);
+            }
+        } else {
+            trace("GETRANDOM off=%llu req=%zu ret=%zd\n", off, allowed, r);
+        }
+    } else {
+        trace("GETRANDOM off=%llu req=%zu ret=%zd\n",
+              rand_total, allowed, r);
+    }
+    return r;
 }

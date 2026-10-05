@@ -1,0 +1,20 @@
+# On Linux the getrandom crate's default backend issues the getrandom(2)
+# syscall through inline assembly (the `linux_raw` backend). That bypasses
+# libc, so the fault-injection shim in tests/support/permfail (loaded with
+# LD_PRELOAD by the keygen regression tests) cannot interpose on random
+# acquisition and could not deterministically simulate an unavailable or
+# interrupted random source.
+#
+# Selecting the `linux_getrandom` backend routes random acquisition through
+# glibc's getrandom(2) wrapper instead. The syscall semantics are identical
+# (and glibc itself wraps the same kernel call), so keygen behavior in
+# production is unchanged -- but the call is now a normal PLT symbol the
+# preload shim can trace and, under explicit WRAPFILE_TEST_RAND_* knobs,
+# make return partial data or fail. With none of those knobs set the shim
+# forwards every call untouched, and runs without the shim are unaffected
+# altogether.
+#
+# Scoped to Linux targets: the shim itself is Linux/glibc-only, and on
+# every other target getrandom keeps its default backend.
+[target.'cfg(target_os = "linux")']
+rustflags = ["--cfg", "getrandom_backend=\"linux_getrandom\""]
