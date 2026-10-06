@@ -319,11 +319,34 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
         )
     })?;
 
-    // Draw the key from the OS CSPRNG first. If the random source is
-    // unavailable nothing is ever created at the target path.
+    // This stack array is the only buffer this command directly holds that
+    // contains the generated key material: getrandom draws straight into it
+    // (the crate forwards the buffer to the getrandom(2) syscall without
+    // copying it) and the save code only ever borrows it. Whatever happens
+    // below -- success, a random-source failure after zero, some, or all 32
+    // bytes, or a failure creating/permissioning/writing/closing the file --
+    // the array is wiped before this operation returns, and the wipe must
+    // survive an optimizing compiler. It therefore lives here in this
+    // wrapper rather than at the individual return sites, so no error branch
+    // inside the save logic can bypass it.
     let mut key = [0u8; KEY_LEN];
-    if let Err(e) = getrandom::fill(&mut key) {
-        key.fill(0);
+    let outcome = save_key_file(&c_path, path, &mut key);
+    secure_zero(&mut key);
+    outcome
+}
+
+#[cfg(unix)]
+fn save_key_file(
+    c_path: &CString,
+    path: &OsStr,
+    key: &mut [u8; KEY_LEN],
+) -> std::io::Result<()> {
+    // Draw the key from the OS CSPRNG first. If the random source is
+    // unavailable nothing is ever created at the target path. Bytes already
+    // delivered on a mid-draw failure are secret material even though no
+    // complete key exists: they are wiped by the caller on the way out, and
+    // they are neither zero-padded into a stand-in key nor reported.
+    if let Err(e) = getrandom::fill(key) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("cryptographic random source unavailable: {e}"),
@@ -351,7 +374,6 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
     };
     if fd < 0 {
         let e = std::io::Error::last_os_error();
-        key.fill(0);
         return Err(std::io::Error::new(
             e.kind(),
             format!("cannot create key file {}: {e}", render_path(path)),
@@ -361,9 +383,10 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
 
     // Enforce and confirm exactly 0600 before writing, then write and fsync.
     // On any failure the inode we just created is unlinked by abort_save; an
-    // object predating this invocation is never touched.
-    let outcome = ensure_owner_only_mode(fd).and_then(|()| write_key(fd, &key));
-    key.fill(0);
+    // object predating this invocation is never touched. The key buffer is
+    // wiped by generate_key_file on the way out of every arm below --
+    // including the close-failure arm -- so it is not zeroed here.
+    let outcome = ensure_owner_only_mode(fd).and_then(|()| write_key(fd, key));
 
     match outcome {
         // The descriptor is still open: abort_save unlinks while it is (only
@@ -392,6 +415,34 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
                 format!("closing the key file failed: {e}"),
             );
             Err(abort_save(&c_path, path, None, stage))
+        }
+    }
+}
+
+/// Overwrite a secret-holding buffer with zeroes in a way the compiler must
+/// keep.
+///
+/// A plain `buf.fill(0)` at the end of a key's lifetime is not enough: once
+/// the buffer is never read again, an optimizing compiler is free to delete
+/// those stores as dead code, so under an optimized build the secret bytes
+/// would stay on the stack. Every byte here is written through
+/// `write_volatile`, which the optimizer must emit regardless of later
+/// reads -- the same guarantee libc's `explicit_bzero(3)` gives -- so the
+/// erasure does not depend on the optimization level. It is implemented
+/// directly rather than calling a libc symbol so the protection also holds
+/// on Unix targets whose libc does not provide `explicit_bzero`.
+///
+/// Call this for every buffer that directly holds (any prefix of) the
+/// generated key, on both success and every error path.
+#[cfg(unix)]
+fn secure_zero(buf: &mut [u8]) {
+    let base = buf.as_mut_ptr();
+    for offset in 0..buf.len() {
+        // SAFETY: `offset` is in bounds of `buf`, a live allocation
+        // exclusively borrowed for this whole call; `u8` imposes no
+        // initialization invariant and has no drop glue.
+        unsafe {
+            std::ptr::write_volatile(base.add(offset), 0u8);
         }
     }
 }
