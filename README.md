@@ -4,6 +4,9 @@
 
 ## 构建与运行
 
+正常使用只需要 Rust 工具链与仓库锁定的离线依赖（getrandom、libc），
+不需要 C 编译器或任何测试工具：
+
 ```sh
 cargo build --offline
 ./target/debug/wrapfile --version
@@ -14,6 +17,17 @@ cargo build --offline
 ```text
 wrapfile 0.1.0
 ```
+
+发布版本同样直接构建，也不需要额外条件：
+
+```sh
+cargo build --release --offline
+./target/release/wrapfile --version
+```
+
+> 只有运行下文"权限约定的回归测试"中的故障注入用例才需要 C 编译器等
+> 额外条件；普通构建与发布构建都不会编译测试辅助库，也不会因为测试
+> 专用的编译器设置、头文件缺失或辅助库源码问题而失败。
 
 ## 生成密钥文件
 
@@ -171,8 +185,23 @@ Usage: wrapfile --version
 
 ## 权限约定的回归测试
 
-`cargo test` 会对上述文件权限约定做自动化回归保障（Unix，当前工具链为
-Linux/glibc；在其他系统上相关用例会自动跳过）：
+`cargo test`（或离线环境的 `cargo test --offline`）会对上述文件权限约定
+做自动化回归保障（Unix，当前工具链为 Linux/glibc；在其他系统上相关用例会
+自动跳过）。
+
+执行测试所需条件分两层：
+
+- **不依赖故障注入的用例**（权限、路径、参数处理等大部分断言）与产品构建
+  条件相同：只要 Rust 工具链和离线依赖即可运行。
+- **故障注入用例**额外需要：Linux/glibc 环境（randtrap 还要求
+  x86_64/aarch64），以及一个可用的 C 编译器（`$CC`，未设置时为 `cc`）——
+  测试在运行时按需把 `tests/support` 下的两个 LD_PRELOAD shim 编译成
+  临时 `.so`，不引入任何新的 Rust 依赖。机器上没有 C 编译器、或平台本就不
+  支持相应 shim 时，这些用例会**说明原因后跳过**，其余用例照常执行；但若
+  编译器已经启动却因辅助库编译错误而失败，测试运行会**失败**并给出编译
+  阶段与编译器诊断，不会被当作平台不支持而跳过。
+
+各测试文件覆盖的约定：
 
 - 在进程内 umask `0022` / `0000` / `0777` 下分别运行 keygen，断言恰好
   32 字节、最终权限恰为 `0600`、标准输出只有保存位置提示、且 stdout/stderr
@@ -268,6 +297,9 @@ Linux/glibc；在其他系统上相关用例会自动跳过）：
   `0600`；故障配置下 `--version` 与参数错误（状态码 2）行为不变，瞬时失败
   后的重试可正常成功。
 
-两个 shim 由 `build.rs` 调用系统 `cc` 编译进 `OUT_DIR`，不引入任何新的 Rust
-依赖（仍可 `cargo test --offline`）。
+两个 shim 不再由构建脚本编译：普通构建与发布构建完全不接触 C 工具链，
+生成的 `wrapfile` 可直接运行，版本查询与 keygen 都不需要查找或加载这些
+辅助库。shim 只在 `cargo test` 运行到依赖它们的用例时，由测试辅助代码
+（`tests/common`）调用系统 `cc` 现场编译，因此离线测试方式不变
+（`cargo test --offline`），也不要求为了正常使用而安装故障注入工具。
 

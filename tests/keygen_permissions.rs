@@ -22,6 +22,8 @@
 //! * Existing CLI behaviour (--version, usage/exit code 2) is unchanged.
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -38,7 +40,7 @@ fn bin() -> PathBuf {
 }
 
 fn permfail_so() -> Option<PathBuf> {
-    option_env!("WRAPFILE_PERMFAIL_SO").map(PathBuf::from)
+    common::permfail_so()
 }
 
 // ---------------------------------------------------------------------------

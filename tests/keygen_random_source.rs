@@ -31,6 +31,8 @@
 //! tests can recognise them in files and output.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -46,7 +48,7 @@ fn bin() -> PathBuf {
 }
 
 fn randtrap_so() -> Option<PathBuf> {
-    option_env!("WRAPFILE_RANDTRAP_SO").map(PathBuf::from)
+    common::randtrap_so()
 }
 
 /// The byte the randtrap shim hands to the guest at global draw index `i`

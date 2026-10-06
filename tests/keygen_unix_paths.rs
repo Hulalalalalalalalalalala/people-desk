@@ -46,6 +46,8 @@
 //! keygen_write_safety.rs and is unchanged.
 #![cfg(unix)]
 
+mod common;
+
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
@@ -207,7 +209,7 @@ fn run_keygen_env(dir: &Path, rest: &[&OsStr], extra_env: &[(&str, &str)]) -> Ru
 }
 
 fn permfail_so() -> Option<PathBuf> {
-    option_env!("WRAPFILE_PERMFAIL_SO").map(PathBuf::from)
+    common::permfail_so()
 }
 
 // ---------------------------------------------------------------------------
