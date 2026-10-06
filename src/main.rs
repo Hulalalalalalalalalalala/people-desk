@@ -308,6 +308,112 @@ mod path_render_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod zeroize_tests {
+    use super::{secure_zero, SecretKey, KEY_LEN};
+
+    #[test]
+    fn secure_zero_overwrites_every_byte() {
+        let mut buf = [0xa5u8; KEY_LEN];
+        secure_zero(&mut buf);
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "secure_zero must overwrite every byte with zero"
+        );
+
+        // Also for odd lengths and an empty slice (it must not panic or
+        // leave a tail byte untouched).
+        let mut small = [0xffu8; 7];
+        secure_zero(&mut small);
+        assert_eq!(small, [0u8; 7]);
+        let mut empty: [u8; 0] = [];
+        secure_zero(&mut empty);
+    }
+
+    #[test]
+    fn dropping_a_secret_key_wipes_its_bytes() {
+        // Hold the backing storage in a Box so a raw pointer into it remains
+        // valid after the SecretKey is dropped and the function that owned
+        // it has returned: that is precisely the moment when the old
+        // key.fill(0) writes could have been optimized away.
+        let backing = Box::new(SecretKey::zeroed());
+        // Leak the allocation so the Box's own Drop does not reclaim it; the
+        // pointer stays readable after SecretKey's Drop, below.
+        let raw: *mut SecretKey = Box::into_raw(backing);
+        unsafe {
+            for (i, slot) in (*raw).bytes.iter_mut().enumerate() {
+                *slot = (i as u8).wrapping_mul(13).wrapping_add(7);
+            }
+            std::ptr::drop_in_place(raw);
+            let wiped = std::slice::from_raw_parts((*raw).bytes.as_ptr(), KEY_LEN);
+            assert!(
+                wiped.iter().all(|&b| b == 0),
+                "SecretKey's Drop must leave all zeroes in the storage: {wiped:?}"
+            );
+            // Reclaim the allocation exactly once.
+            drop(Box::from_raw(raw));
+        }
+    }
+}
+
+#[cfg(unix)]
+/// A fixed-size buffer of secret material that is reliably wiped when it
+/// goes out of scope, on every exit path.
+///
+/// A plain `key.fill(0)` is not enough: once the buffer is never read again,
+/// those writes are "dead stores" that an optimizing compiler is allowed to
+/// delete, so the secret bytes could survive in freed/reused stack memory.
+/// `SecretKey` closes that gap two ways:
+///
+/// 1. The bytes are written with volatile stores ([`secure_zero`]), which
+///    the optimizer may not elide or reorder away, regardless of build
+///    profile (debug or optimized).
+/// 2. The wipe runs from `Drop`, so every return that drops the guard --
+///    normal completion and every error return alike -- wipes the buffer;
+///    there is no error branch whose author could forget the wipe.
+struct SecretKey {
+    bytes: [u8; KEY_LEN],
+}
+
+impl SecretKey {
+    /// A zero-filled buffer. Safe to drop before any secret is drawn:
+    /// zeroizing zeroes is harmless.
+    fn zeroed() -> SecretKey {
+        SecretKey { bytes: [0u8; KEY_LEN] }
+    }
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        secure_zero(&mut self.bytes);
+    }
+}
+
+/// Overwrite `buf` with zeroes in a way the compiler cannot optimize out.
+///
+/// The writes are volatile, and the function is `#[inline(never)]` with an
+/// empty optimization barrier before them, so the compiler must emit the
+/// stores even when the caller never reads the buffer afterwards and even
+/// under LTO. This mirrors how secret-wiping crates (e.g. `zeroize`)
+/// guarantee erasure on stable Rust without `explicit_bzero`.
+#[cfg(unix)]
+#[inline(never)]
+fn secure_zero(buf: &mut [u8]) {
+    // Optimization barrier: nothing the optimizer knows can cross it, so it
+    // cannot prove the subsequent stores are dead.
+    std::hint::black_box(&mut buf[..]);
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, properly aligned &mut u8; writing zero is
+        // a valid value for u8.
+        unsafe { std::ptr::write_volatile(b as *mut u8, 0u8) };
+    }
+    // Ensure the stores are not deferred past the caller's return...
+    std::hint::black_box(&mut buf[..]);
+    // ...and compile fences keep the volatile writes ordered relative to any
+    // surrounding access in either direction.
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(unix)]
 fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
     // Use the raw OS bytes so a path containing non-UTF-8 bytes refers to
@@ -319,11 +425,19 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
         )
     })?;
 
+    // `key` holds the only in-process copy of this generation's key
+    // material: the random source writes directly into it and the save path
+    // only ever borrows it. Its Drop reliably zeroizes the bytes on every
+    // way out of this function -- success, an early error return below, or
+    // an unwinding panic -- including when the random source delivered only
+    // part of the 32 bytes before failing. Zeroization touches this memory
+    // buffer alone; a key file already saved is never altered by it.
+    let mut key = SecretKey::zeroed();
+
     // Draw the key from the OS CSPRNG first. If the random source is
-    // unavailable nothing is ever created at the target path.
-    let mut key = [0u8; KEY_LEN];
-    if let Err(e) = getrandom::fill(&mut key) {
-        key.fill(0);
+    // unavailable nothing is ever created at the target path, and dropping
+    // `key` wipes whatever partial bytes the source had delivered.
+    if let Err(e) = getrandom::fill(&mut key.bytes) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("cryptographic random source unavailable: {e}"),
@@ -351,7 +465,6 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
     };
     if fd < 0 {
         let e = std::io::Error::last_os_error();
-        key.fill(0);
         return Err(std::io::Error::new(
             e.kind(),
             format!("cannot create key file {}: {e}", render_path(path)),
@@ -361,9 +474,11 @@ fn generate_key_file(path: &OsStr) -> std::io::Result<()> {
 
     // Enforce and confirm exactly 0600 before writing, then write and fsync.
     // On any failure the inode we just created is unlinked by abort_save; an
-    // object predating this invocation is never touched.
-    let outcome = ensure_owner_only_mode(fd).and_then(|()| write_key(fd, &key));
-    key.fill(0);
+    // object predating this invocation is never touched. The key buffer is
+    // wiped by `key`'s Drop on every return below (it is never taken out of
+    // the guard), so no explicit zeroization is needed -- or possible to
+    // forget -- on any error branch.
+    let outcome = ensure_owner_only_mode(fd).and_then(|()| write_key(fd, &key.bytes));
 
     match outcome {
         // The descriptor is still open: abort_save unlinks while it is (only
