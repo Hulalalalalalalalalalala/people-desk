@@ -206,9 +206,9 @@ fn run_keygen_env(dir: &Path, rest: &[&OsStr], extra_env: &[(&str, &str)]) -> Ru
     }
 }
 
-fn permfail_so() -> Option<PathBuf> {
-    option_env!("WRAPFILE_PERMFAIL_SO").map(PathBuf::from)
-}
+#[path = "support/shims.rs"]
+mod shims;
+use shims::permfail_so;
 
 // ---------------------------------------------------------------------------
 // filesystem assertions
@@ -596,7 +596,6 @@ fn create_error_escapes_the_target_and_carries_no_raw_controls() {
 #[test]
 fn cleanup_message_escapes_a_non_utf8_target_when_unlink_is_refused() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 

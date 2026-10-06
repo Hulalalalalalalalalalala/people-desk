@@ -45,9 +45,9 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_wrapfile"))
 }
 
-fn randtrap_so() -> Option<PathBuf> {
-    option_env!("WRAPFILE_RANDTRAP_SO").map(PathBuf::from)
-}
+#[path = "support/shims.rs"]
+mod shims;
+use shims::randtrap_so;
 
 /// The byte the randtrap shim hands to the guest at global draw index `i`
 /// (see pattern_byte() in randtrap.c).
@@ -319,7 +319,6 @@ impl Sentinel {
 #[test]
 fn random_source_unavailable_before_any_byte_saves_nothing() {
     let Some(so) = randtrap_so() else {
-        eprintln!("skipping: randtrap shim not available on this target");
         return;
     };
 
@@ -370,7 +369,6 @@ fn random_source_unavailable_before_any_byte_saves_nothing() {
 #[test]
 fn random_source_failure_after_partial_bytes_saves_nothing() {
     let Some(so) = randtrap_so() else {
-        eprintln!("skipping: randtrap shim not available on this target");
         return;
     };
 
@@ -436,7 +434,6 @@ fn random_source_failure_after_partial_bytes_saves_nothing() {
 #[test]
 fn short_reads_from_random_source_still_complete_the_key() {
     let Some(so) = randtrap_so() else {
-        eprintln!("skipping: randtrap shim not available on this target");
         return;
     };
 
@@ -504,7 +501,6 @@ fn short_reads_from_random_source_still_complete_the_key() {
 #[test]
 fn random_failure_preserves_existing_file_target() {
     let Some(so) = randtrap_so() else {
-        eprintln!("skipping: randtrap shim not available on this target");
         return;
     };
 
@@ -545,7 +541,6 @@ fn random_failure_preserves_existing_file_target() {
 #[test]
 fn random_failure_preserves_symlink_target_and_referent() {
     let Some(so) = randtrap_so() else {
-        eprintln!("skipping: randtrap shim not available on this target");
         return;
     };
 
@@ -590,7 +585,6 @@ fn random_failure_preserves_symlink_target_and_referent() {
 #[test]
 fn shim_without_fault_uses_the_real_random_source() {
     let Some(so) = randtrap_so() else {
-        eprintln!("skipping: randtrap shim not available on this target");
         return;
     };
 
@@ -631,7 +625,6 @@ fn shim_without_fault_uses_the_real_random_source() {
 #[test]
 fn injection_does_not_affect_version_or_argument_handling() {
     let Some(so) = randtrap_so() else {
-        eprintln!("skipping: randtrap shim not available on this target");
         return;
     };
 

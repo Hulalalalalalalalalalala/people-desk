@@ -4,6 +4,10 @@
 
 ## 构建与运行
 
+正常使用只需要 Rust 工具链（能编译并链接本程序及其两个 Rust 依赖
+getrandom、libc 即可），**不需要系统 C 编译器、任何 C 头文件或其他辅助
+工具**。版本查询与 keygen 都不依赖任何额外的本地库：
+
 ```sh
 cargo build --offline
 ./target/debug/wrapfile --version
@@ -14,6 +18,19 @@ cargo build --offline
 ```text
 wrapfile 0.1.0
 ```
+
+离线构建方式保持不变：在依赖已齐备的环境中可一直使用 `--offline`，
+无需为正常使用开启任何测试选项。发布版本同理，同样不调用 C 编译器：
+
+```sh
+cargo build --release --offline
+./target/release/wrapfile --version
+```
+
+下面提到的故障注入测试所用的 C 辅助库（shim）**只在运行测试时按需
+编译**，不属于产品构建：普通的 `cargo build` / `cargo build --release`
+（无论是否 `--offline`）都不会尝试编译它们，也不会因为测试专用的 C
+编译器设置、头文件缺失或辅助库源码编译错误而失败。
 
 ## 生成密钥文件
 
@@ -172,7 +189,37 @@ Usage: wrapfile --version
 ## 权限约定的回归测试
 
 `cargo test` 会对上述文件权限约定做自动化回归保障（Unix，当前工具链为
-Linux/glibc；在其他系统上相关用例会自动跳过）：
+Linux/glibc；在其他系统上相关用例会自动跳过）。
+
+### 运行故障注入测试所需的条件
+
+这一部分条件**只与测试有关，正常构建和使用 wrapfile 不需要**（见上文
+"构建与运行"）。shim 由测试在**运行时按需**调用系统 C 编译器编译（不经过
+`build.rs`，因此不会影响普通构建），运行故障注入用例需要：
+
+- Linux/glibc 环境（permfail shim 依赖 glibc 的 open/fstat 符号拦截语义）；
+- 能正常使用的系统 C 编译器（环境变量 `CC` 指定，缺省为 `cc`），以及编译
+  shim 所需的标准头文件（randtrap shim 还需要内核 UAPI 头文件
+  `linux/seccomp.h` 等）；
+- randtrap 的随机源用例还要求 x86_64 或 aarch64（seccomp `SECCOMP_RET_TRAP`
+  的信号帧寄存器访问目前只支持这两种架构），且内核允许 seccomp。
+
+**跳过与失败的区分**：
+
+- 平台确实不受支持（非 Linux，或非 x86_64/aarch64 上的 randtrap 用例）、
+  或系统中找不到 C 编译器时，依赖 shim 的用例打印明确的跳过原因后跳过，
+  不依赖 shim 的用例照常执行；这与既有的跳过约定一致。
+- C 编译器**已经启动，却因辅助库源码（或头文件、编译参数）问题编译
+  失败**时，测试**失败**而不是跳过：错误信息会指出失败发生在编译 shim 的
+  阶段并附上编译器输出，不会被误报成"平台不支持"。
+
+离线测试方式保持不变，不引入任何新的 Rust 依赖：
+
+```sh
+cargo test --offline
+```
+
+下面是各测试文件保障的内容：
 
 - 在进程内 umask `0022` / `0000` / `0777` 下分别运行 keygen，断言恰好
   32 字节、最终权限恰为 `0600`、标准输出只有保存位置提示、且 stdout/stderr
@@ -268,6 +315,7 @@ Linux/glibc；在其他系统上相关用例会自动跳过）：
   `0600`；故障配置下 `--version` 与参数错误（状态码 2）行为不变，瞬时失败
   后的重试可正常成功。
 
-两个 shim 由 `build.rs` 调用系统 `cc` 编译进 `OUT_DIR`，不引入任何新的 Rust
-依赖（仍可 `cargo test --offline`）。
+两个 shim 在测试运行时由 `tests/support/shims.rs` 调用系统 `cc` 按需编译
+（缓存在临时目录，按源码内容命名，普通构建完全不会触发），不引入任何新的
+Rust 依赖（仍可 `cargo test --offline`）。
 

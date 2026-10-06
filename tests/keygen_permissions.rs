@@ -37,9 +37,9 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_wrapfile"))
 }
 
-fn permfail_so() -> Option<PathBuf> {
-    option_env!("WRAPFILE_PERMFAIL_SO").map(PathBuf::from)
-}
+#[path = "support/shims.rs"]
+mod shims;
+use shims::permfail_so;
 
 // ---------------------------------------------------------------------------
 // scratch directory
@@ -331,7 +331,6 @@ fn succeeds_with_exactly_0600_under_all_umasks() {
 #[test]
 fn permissions_set_and_confirmed_before_any_key_byte() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -389,7 +388,6 @@ fn permissions_set_and_confirmed_before_any_key_byte() {
 #[test]
 fn fchmod_rejection_fails_explains_and_cleans_up() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -429,7 +427,6 @@ fn fchmod_rejection_fails_explains_and_cleans_up() {
 #[test]
 fn unconfirmable_mode_fails_and_cleans_up() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -514,7 +511,6 @@ fn existing_objects_are_never_modified() {
 #[test]
 fn failure_leaves_parent_and_siblings_untouched() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -585,7 +581,6 @@ fn version_and_argument_handling_unchanged() {
 #[test]
 fn fchmod_rejection_with_unlink_refused_reports_both_and_warns_of_residue() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 

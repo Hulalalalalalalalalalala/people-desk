@@ -63,9 +63,9 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_wrapfile"))
 }
 
-fn permfail_so() -> Option<PathBuf> {
-    option_env!("WRAPFILE_PERMFAIL_SO").map(PathBuf::from)
-}
+#[path = "support/shims.rs"]
+mod shims;
+use shims::permfail_so;
 
 // ---------------------------------------------------------------------------
 // scratch directory
@@ -442,7 +442,6 @@ impl Sentinel {
 #[test]
 fn partial_writes_save_the_full_key_exactly_once() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -498,7 +497,6 @@ fn partial_writes_save_the_full_key_exactly_once() {
 #[test]
 fn interrupted_writes_are_retried_until_the_key_is_saved() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -540,7 +538,6 @@ fn interrupted_writes_are_retried_until_the_key_is_saved() {
 #[test]
 fn unrecoverable_write_error_fails_and_removes_the_partial_file() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -598,7 +595,6 @@ fn unrecoverable_write_error_fails_and_removes_the_partial_file() {
 #[test]
 fn fsync_failure_after_full_write_fails_and_removes_the_file() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -646,7 +642,6 @@ fn fsync_failure_after_full_write_fails_and_removes_the_file() {
 #[test]
 fn zero_byte_write_before_any_progress_fails_and_leaves_no_file() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -719,7 +714,6 @@ fn zero_byte_write_before_any_progress_fails_and_leaves_no_file() {
 #[test]
 fn zero_byte_write_after_partial_progress_removes_the_partial_file() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -789,7 +783,6 @@ fn zero_byte_write_after_partial_progress_removes_the_partial_file() {
 #[test]
 fn close_error_after_fsync_fails_and_removes_the_file() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -861,7 +854,6 @@ fn close_error_after_fsync_fails_and_removes_the_file() {
 #[test]
 fn close_eintr_after_fsync_still_reports_success() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -894,7 +886,6 @@ fn close_eintr_after_fsync_still_reports_success() {
 #[test]
 fn close_error_with_unlink_refused_reports_both_and_warns_of_residue() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -1001,7 +992,6 @@ fn close_error_with_unlink_refused_reports_both_and_warns_of_residue() {
 #[test]
 fn write_error_with_unlink_refused_reports_both_and_warns_of_residue() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -1079,7 +1069,6 @@ fn write_error_with_unlink_refused_reports_both_and_warns_of_residue() {
 #[test]
 fn fsync_error_with_unlink_refused_reports_both_and_warns_of_residue() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
@@ -1152,7 +1141,6 @@ fn fsync_error_with_unlink_refused_reports_both_and_warns_of_residue() {
 #[test]
 fn zero_byte_write_with_unlink_refused_warns_about_empty_residue() {
     let Some(so) = permfail_so() else {
-        eprintln!("skipping: permfail shim not available on this target");
         return;
     };
 
