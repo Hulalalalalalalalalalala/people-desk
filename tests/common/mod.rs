@@ -1,6 +1,6 @@
 //! Shared helpers for the keygen regression tests: build the LD_PRELOAD
-//! fault-injection shims (tests/support/permfail, tests/support/randtrap)
-//! on demand, at test time.
+//! fault-injection shims (tests/support/permfail, tests/support/randtrap,
+//! tests/support/keywipe) on demand, at test time.
 //!
 //! The shims are compiled here rather than by a Cargo build script so that
 //! `cargo build` / `cargo build --release` never invoke a C compiler: a
@@ -78,6 +78,39 @@ pub fn randtrap_so() -> Option<PathBuf> {
             "randtrap",
             "libwrapfile_randtrap.so",
             "tests/support/randtrap/randtrap.c",
+        )
+    })
+    .clone()
+}
+
+/// Path to the keywipe shim, building it on first use. `None` (with the
+/// reason on stderr) when this platform or machine cannot provide it.
+pub fn keywipe_so() -> Option<PathBuf> {
+    // The keywipe shim relies on seccomp SECCOMP_RET_TRAP plus
+    // signal-frame register access and single-stepping (x86_64 and
+    // aarch64 only).
+    static SO: OnceLock<Option<PathBuf>> = OnceLock::new();
+    SO.get_or_init(|| {
+        if std::env::consts::OS != "linux" {
+            eprintln!(
+                "keywipe shim unavailable: only supported on Linux, \
+                 this target is {}",
+                std::env::consts::OS
+            );
+            return None;
+        }
+        if !matches!(std::env::consts::ARCH, "x86_64" | "aarch64") {
+            eprintln!(
+                "keywipe shim unavailable: only supported on x86_64/aarch64, \
+                 this target is {}",
+                std::env::consts::ARCH
+            );
+            return None;
+        }
+        build_shim(
+            "keywipe",
+            "libwrapfile_keywipe.so",
+            "tests/support/keywipe/keywipe.c",
         )
     })
     .clone()
