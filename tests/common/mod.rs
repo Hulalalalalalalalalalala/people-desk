@@ -83,6 +83,45 @@ pub fn randtrap_so() -> Option<PathBuf> {
     .clone()
 }
 
+/// Path to the keylife observer executable, building it on first use.
+/// `None` (with the reason on stderr) when this platform or machine cannot
+/// provide it.
+///
+/// Unlike the two shims this is a standalone program (not an LD_PRELOAD
+/// library): it forks, has its child traceme+exec the real wrapfile, and
+/// watches the temporary key buffer from outside with ptrace. It is
+/// therefore linked as an ordinary executable, not as a `-shared` object.
+pub fn keylife_bin() -> Option<PathBuf> {
+    // PTRACE_GET_SYSCALL_INFO and the seccomp/SIGSYS interaction it relies
+    // on are Linux-only, and the register/insn decoding covers the same two
+    // architectures as the randtrap shim.
+    static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BIN.get_or_init(|| {
+        if std::env::consts::OS != "linux" {
+            eprintln!(
+                "keylife observer unavailable: only supported on Linux, \
+                 this target is {}",
+                std::env::consts::OS
+            );
+            return None;
+        }
+        if !matches!(std::env::consts::ARCH, "x86_64" | "aarch64") {
+            eprintln!(
+                "keylife observer unavailable: only supported on \
+                 x86_64/aarch64, this target is {}",
+                std::env::consts::ARCH
+            );
+            return None;
+        }
+        build_support_exe(
+            "keylife",
+            "keylife-observer",
+            "tests/support/keylife/keylife.c",
+        )
+    })
+    .clone()
+}
+
 /// Compile one shim with the system C compiler. Returns the built path, or
 /// `None` (reason printed) when no C compiler exists on this machine. A
 /// compiler that starts but fails to build the shim is a hard error.
@@ -130,5 +169,60 @@ fn build_shim(label: &str, so_name: &str, src_rel: &str) -> Option<PathBuf> {
             None
         }
         Err(e) => panic!("failed to run C compiler '{cc}' while building test shim '{label}': {e}"),
+    }
+}
+
+/// Compile one test-only support *executable* (rather than an LD_PRELOAD
+/// shared object) with the system C compiler. Same skip/fail policy as
+/// `build_shim`: no compiler -> `None` (skip with the reason printed); a
+/// compiler that ran but rejected the source -> hard panic.
+///
+/// The executable's name must not start with "wrapfile": the randtrap and
+/// permfail shims arm themselves from the guest executable's basename, and
+/// the observer is launched with those shims in LD_PRELOAD (it then
+/// fork/execs the real wrapfile, where they *should* arm).
+fn build_support_exe(label: &str, exe_name: &str, src_rel: &str) -> Option<PathBuf> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join(src_rel);
+
+    // Same per-process scratch directory policy as build_shim, so parallel
+    // test binaries never overwrite one another's observer.
+    let dir = option_env!("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("wrapfile-test-shims-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        panic!("cannot create test shim build directory {}: {e}", dir.display())
+    });
+    let exe = dir.join(exe_name);
+
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let output = Command::new(&cc)
+        // -O2 so the observer itself is quick (it single-steps the guest);
+        // no -shared: this is a normal executable that links libc.
+        .args(["-O2", "-g", "-Wall", "-Wextra"])
+        .arg("-o")
+        .arg(&exe)
+        .arg(&src)
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => Some(exe),
+        Ok(o) => panic!(
+            "test support program '{label}' failed to compile: `{cc}` exited \
+             with {} while building {src_rel}\ncompiler stderr:\n{}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "{label} support program not built: C compiler '{cc}' not \
+                 found; install a C compiler to run the memory-zeroing tests"
+            );
+            None
+        }
+        Err(e) => panic!(
+            "failed to run C compiler '{cc}' while building test support \
+             program '{label}': {e}"
+        ),
     }
 }
