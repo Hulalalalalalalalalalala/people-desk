@@ -24,11 +24,13 @@
 //! LD_PRELOAD shim): it forks, its child PTRACE_TRACEME's itself and execs
 //! wrapfile, and the observer locates the 32-byte buffer at the getrandom
 //! syscall, reads it across the file operations, and single-steps the guest
-//! after the save (success), after the emulated random-source failure, and
-//! after a mid-save write failure to watch the whole buffer become zero
-//! before the first stdout/stderr write. For a partial-draw failure it also
-//! plants a non-zero sentinel in the slots the random source never delivered
-//! (those slots stay zero from initialization), so a wipe covering only the
+//! after the save (success -- including a close that merely reports EINTR),
+//! after the emulated random-source failure, after a mid-save write failure,
+//! and after an unrecoverable close error (with the cleanup both allowed
+//! and refused) to watch the whole buffer become zero before the first
+//! stdout/stderr write. For a partial-draw failure it also plants a
+//! non-zero sentinel in the slots the random source never delivered (those
+//! slots stay zero from initialization), so a wipe covering only the
 //! delivered prefix is caught too.
 //!
 //! The random source is made deterministic and fail-able by the existing
@@ -378,6 +380,58 @@ fn key_fill_base(events: &[GrEvent]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// permfail shim trace (its lines share the trace file with randtrap's)
+// ---------------------------------------------------------------------------
+
+struct ShimEvent {
+    kind: String,
+    attrs: HashMap<String, String>,
+}
+
+impl ShimEvent {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.attrs.get(key).map(String::as_str)
+    }
+}
+
+fn shim_events(trace: &Path) -> Vec<ShimEvent> {
+    fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut it = line.split_whitespace();
+            let kind = it.next().unwrap_or("").to_string();
+            let attrs = it
+                .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                .collect();
+            ShimEvent { kind, attrs }
+        })
+        .collect()
+}
+
+fn shim_event_seen(events: &[ShimEvent], kind: &str, key: &str, value: &str) -> bool {
+    events
+        .iter()
+        .any(|e| e.kind == kind && e.get(key) == Some(value))
+}
+
+/// The bytes the key file's write() calls landed, reconstructed from the
+/// shim's TRACE_BYTES hex in call order.
+fn landed_bytes(events: &[ShimEvent]) -> Vec<u8> {
+    events
+        .iter()
+        .filter(|e| e.kind == "WRITE")
+        .filter_map(|e| e.get("hex"))
+        .flat_map(|hex| {
+            assert_eq!(hex.len() % 2, 0, "odd hex in trace line");
+            (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+                .collect::<Vec<u8>>()
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // filesystem helpers
 // ---------------------------------------------------------------------------
 
@@ -397,6 +451,22 @@ fn assert_sentinel_untouched(path: &Path, bytes: &[u8], mode: u32) {
     let meta = fs::metadata(path).unwrap();
     assert_eq!(meta.mode() & 0o7777, mode, "sibling permissions changed");
     assert_eq!(fs::read(path).unwrap(), bytes, "sibling contents changed");
+}
+
+/// Key material must not surface on stdout/stderr in any encoding: not as
+/// raw bytes, and not as a hex rendering.
+fn assert_key_not_leaked(out: &[u8], err: &[u8], secret: &[u8]) {
+    assert!(
+        !contains_slice(out, secret) && !contains_slice(err, secret),
+        "the key must never appear on stdout/stderr as raw bytes"
+    );
+    let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    let out_text = String::from_utf8_lossy(out);
+    let err_text = String::from_utf8_lossy(err);
+    assert!(
+        !out_text.contains(&hex) && !err_text.contains(&hex),
+        "the key must never appear on stdout/stderr in hex form"
+    );
 }
 
 // Every scenario needs the observer to run successfully (rc 0) and reach a
@@ -758,6 +828,338 @@ fn write_failure_after_full_key_still_wipes_the_full_key(
     assert_eq!(mode_of(&tmp.path), parent_before, "parent mode must survive");
 }
 
+/// Shared observer-side assertions for the two close-failure scenarios:
+/// the full non-zero key was delivered and borrowed through the save, the
+/// injected close fault really fired after a complete synced write, and the
+/// whole buffer was wiped in a tight local loop after the failed close and
+/// before the first failure-report byte.
+fn assert_closefail_wipe(obs: &Observation, trace: &Path, profile: &str) -> Vec<u8> {
+    assert_eq!(
+        obs.rc, 0,
+        "[{profile}] observer must confirm the wipe, got FAIL: {:?}",
+        obs.fail.clone()
+    );
+
+    // The full, non-zero key really was delivered and is what the save
+    // borrowed (never zeroed before or during the writes).
+    let secret = obs.secret();
+    assert_eq!(secret.len(), KEY_LEN);
+    assert!(secret.iter().all(|&b| b != 0));
+    let delivered = key_fill_bytes(&getrandom_events(trace));
+    assert_eq!(delivered.len(), KEY_LEN);
+    assert_eq!(secret, delivered, "observed buffer bytes must equal delivery");
+    assert!(!obs.named("WRITE_BORROWS").is_empty(), "key writes must be seen");
+
+    // The fault really was injected: all 32 bytes landed and were synced,
+    // then close reported EIO (the descriptor was really released).
+    let shim = shim_events(trace);
+    assert!(
+        shim_event_seen(&shim, "FSYNC", "ret", "0"),
+        "the key must have been fully synced before the close"
+    );
+    assert!(
+        shim_event_seen(&shim, "CLOSE", "errno", "EIO"),
+        "the unrecoverable close error must have been injected"
+    );
+    assert_eq!(
+        landed_bytes(&shim),
+        secret,
+        "the bytes that landed on disk are exactly the delivered key"
+    );
+
+    // The key was still held when the close returned; the whole buffer was
+    // then wiped before the failure report and before the operation
+    // returned.
+    assert!(
+        obs.first("CLOSE_STILL_HELD").is_some(),
+        "the full key must still be held when the failed close returns"
+    );
+    let wiped = obs.first("WIPED").expect("WIPED event");
+    assert_eq!(wiped.usize("held"), Some(KEY_LEN));
+    assert_eq!(wiped.usize("sentinel"), Some(0));
+    let steps = wiped.i64("steps").expect("WIPED steps=");
+    assert!(
+        (1..1_000_000).contains(&steps),
+        "wipe must be a small bounded local loop, got {steps} steps"
+    );
+    let i_close = obs.index("CLOSE_STILL_HELD").unwrap();
+    let i_wiped = obs.index("WIPED").unwrap();
+    let i_output = obs
+        .index("OUTPUT_AFTER_WIPE")
+        .expect("the failure report must be observed after the wipe");
+    assert!(i_close < i_wiped, "wipe must follow the failed close");
+    assert!(i_wiped < i_output, "wipe must precede the failure report");
+    assert_eq!(
+        obs.first("GUEST_EXIT").and_then(|e| e.i64("rc")),
+        Some(1),
+        "an unrecoverable close error must fail the save"
+    );
+
+    secret
+}
+
+fn close_failure_after_full_save_still_wipes_the_full_key(
+    sup: &Support,
+    bin: &Path,
+    profile: &str,
+) {
+    let tmp = Tmp::new(&format!("closefail-{profile}"));
+    let key = tmp.child("key");
+    let (sib, sib_bytes, sib_mode) = make_sibling(&tmp.path);
+    let parent_before = mode_of(&tmp.path);
+    let trace = tmp.child("trace.log");
+    fs::File::create(&trace).unwrap();
+    fs::set_permissions(&trace, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Deterministic full key; all 32 bytes are written and fsynced, then
+    // the permfail shim really releases the descriptor but reports EIO for
+    // the close. The file on disk briefly looks complete -- the save must
+    // still fail, the file must be removed, and the in-memory key must be
+    // wiped before the failure is reported.
+    let obs = observe(
+        &sup.observer,
+        bin,
+        "closefail",
+        &key,
+        &[sup.randtrap.clone(), sup.permfail.clone()],
+        &[
+            ("WRAPFILE_TEST_GETRANDOM_PARTIAL", "8"),
+            ("WRAPFILE_TEST_FAIL_CLOSE", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+    if !observer_ran(&obs) {
+        return;
+    }
+    if !trap_armed(&trace) {
+        eprintln!("skipping: randtrap seccomp trap did not arm here");
+        return;
+    }
+    let secret = assert_closefail_wipe(&obs, &trace, profile);
+
+    // abort_save's cleanup ran while the full key was still held; the wipe
+    // came only afterwards.
+    assert!(
+        obs.first("ABORT_UNLINK").is_some(),
+        "the cleanup unlink must still see the full key"
+    );
+    assert!(
+        obs.index("ABORT_UNLINK").unwrap() < obs.index("WIPED").unwrap(),
+        "wipe must follow the abort cleanup"
+    );
+
+    // Public failure behavior: exit 1, empty stdout, stderr says the
+    // failure happened while closing the key file and names the target;
+    // this run's file is gone; the key leaks nowhere.
+    assert!(!key.exists(), "the file from the failed close must be removed");
+    let (out, err) = guest_captured(&key);
+    assert!(out.is_empty(), "no success message on failure");
+    let err_text = String::from_utf8_lossy(&err);
+    assert!(
+        err_text.contains("closing the key file"),
+        "stderr must say the failure happened at close time: {err_text}"
+    );
+    assert!(
+        err_text.contains(&key.display().to_string()),
+        "stderr must name the target: {err_text}"
+    );
+    assert_key_not_leaked(&out, &err, &secret);
+
+    assert_sentinel_untouched(&sib, &sib_bytes, sib_mode);
+    assert_eq!(mode_of(&tmp.path), parent_before, "parent mode must survive");
+}
+
+fn close_failure_with_unlink_refused_still_wipes_the_full_key(
+    sup: &Support,
+    bin: &Path,
+    profile: &str,
+) {
+    let tmp = Tmp::new(&format!("closefail-unlink-refused-{profile}"));
+    let key = tmp.child("key");
+    let (sib, sib_bytes, sib_mode) = make_sibling(&tmp.path);
+    let parent_before = mode_of(&tmp.path);
+    let trace = tmp.child("trace.log");
+    fs::File::create(&trace).unwrap();
+    fs::set_permissions(&trace, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Same unrecoverable close error, but the system also refuses to remove
+    // this run's file (the shim's unlink fails with EACCES without any
+    // syscall). The same in-memory wipe contract must hold, and the report
+    // must keep the close failure while warning about the residue.
+    let obs = observe(
+        &sup.observer,
+        bin,
+        "closefail",
+        &key,
+        &[sup.randtrap.clone(), sup.permfail.clone()],
+        &[
+            ("WRAPFILE_TEST_GETRANDOM_PARTIAL", "8"),
+            ("WRAPFILE_TEST_FAIL_CLOSE", "1"),
+            ("WRAPFILE_TEST_FAIL_UNLINK", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+    if !observer_ran(&obs) {
+        return;
+    }
+    if !trap_armed(&trace) {
+        eprintln!("skipping: randtrap seccomp trap did not arm here");
+        return;
+    }
+    let secret = assert_closefail_wipe(&obs, &trace, profile);
+
+    // The refused cleanup really was injected, in user space: no unlinkat
+    // syscall ever reached the kernel, so the observer saw no ABORT_UNLINK.
+    let shim = shim_events(&trace);
+    assert!(
+        shim_event_seen(&shim, "UNLINK", "errno", "EACCES"),
+        "the refused cleanup must have been injected"
+    );
+    assert!(
+        obs.first("ABORT_UNLINK").is_none(),
+        "a refused unlink performs no syscall the observer could see"
+    );
+
+    // Public failure behavior: exit 1, empty stdout; stderr keeps the close
+    // failure, reports the unfinished cleanup, and warns that this run's
+    // file may remain -- never that it is gone, never a success.
+    let (out, err) = guest_captured(&key);
+    assert!(out.is_empty(), "no success message on failure");
+    let err_text = String::from_utf8_lossy(&err);
+    assert!(
+        err_text.contains("closing the key file"),
+        "stderr must keep the close failure reason: {err_text}"
+    );
+    assert!(
+        err_text.contains(&key.display().to_string()),
+        "stderr must name the target: {err_text}"
+    );
+    assert!(
+        err_text.contains("cleanup"),
+        "stderr must report the failed cleanup: {err_text}"
+    );
+    assert!(
+        err_text.contains("may still be present"),
+        "stderr must warn that this run's file may remain: {err_text}"
+    );
+    assert!(
+        !err_text.contains("Key saved to"),
+        "the residue must not be reported as a saved key: {err_text}"
+    );
+    assert_key_not_leaked(&out, &err, &secret);
+
+    // The residue really is this run's file: 32 bytes, mode 0600 -- it
+    // looks complete, yet it is not a saved key (the warning above is what
+    // keeps it from being mistaken for one). Nothing was stashed under
+    // another name.
+    let residue = fs::read(&key).expect("with unlink refused, this run's file remains");
+    assert_eq!(residue.len(), KEY_LEN);
+    assert_eq!(
+        residue, secret,
+        "the residue is exactly the key this failed run wrote"
+    );
+    assert_eq!(mode_of(&key), MODE_0600, "residue keeps mode 0600");
+
+    assert_sentinel_untouched(&sib, &sib_bytes, sib_mode);
+    assert_eq!(
+        mode_of(&tmp.path),
+        parent_before,
+        "parent directory permissions must never be loosened to force cleanup"
+    );
+
+    // Remove the residue manually (the user is told to); the scratch dir
+    // must not keep a key around.
+    fs::remove_file(&key).unwrap();
+}
+
+fn close_eintr_boundary_saves_and_wipes_before_the_report(
+    sup: &Support,
+    bin: &Path,
+    profile: &str,
+) {
+    let tmp = Tmp::new(&format!("close-eintr-{profile}"));
+    let key = tmp.child("key");
+    let trace = tmp.child("trace.log");
+    fs::File::create(&trace).unwrap();
+    fs::set_permissions(&trace, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // close() releases the descriptor but reports EINTR: an interruption,
+    // not a failure. The save succeeds and the temporary key is still wiped
+    // before the success report. From the observer's side the close syscall
+    // itself succeeds, so this runs under the success scenario.
+    let obs = observe(
+        &sup.observer,
+        bin,
+        "success",
+        &key,
+        &[sup.randtrap.clone(), sup.permfail.clone()],
+        &[
+            ("WRAPFILE_TEST_GETRANDOM_PARTIAL", "8"),
+            ("WRAPFILE_TEST_CLOSE_EINTR", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+    if !observer_ran(&obs) {
+        return;
+    }
+    if !trap_armed(&trace) {
+        eprintln!("skipping: randtrap seccomp trap did not arm here");
+        return;
+    }
+    assert_eq!(
+        obs.rc, 0,
+        "[{profile}] observer must report success, got FAIL: {:?}",
+        obs.fail.clone()
+    );
+
+    // The interruption really was injected: the descriptor was released and
+    // close only *reported* EINTR.
+    let shim = shim_events(&trace);
+    assert!(
+        shim_event_seen(&shim, "CLOSE", "errno", "EINTR"),
+        "the EINTR-on-close must have been injected"
+    );
+
+    // The full non-zero key was delivered, borrowed through the save, still
+    // held when close returned, and wiped before the success report.
+    let secret = obs.secret();
+    assert_eq!(secret.len(), KEY_LEN);
+    assert!(secret.iter().all(|&b| b != 0));
+    assert!(!obs.named("WRITE_BORROWS").is_empty(), "key writes must be seen");
+    assert!(obs.first("CLOSE_STILL_HELD").is_some());
+    let wiped = obs.first("WIPED").expect("WIPED event");
+    assert_eq!(wiped.usize("held"), Some(KEY_LEN));
+    assert_eq!(wiped.usize("sentinel"), Some(0));
+    let i_close = obs.index("CLOSE_STILL_HELD").unwrap();
+    let i_wiped = obs.index("WIPED").unwrap();
+    let i_output = obs
+        .index("OUTPUT_AFTER_WIPE")
+        .expect("a post-wipe stdout write must be seen");
+    assert!(i_close < i_wiped, "wipe must follow the close");
+    assert!(i_wiped < i_output, "wipe must precede the success report");
+    assert_eq!(
+        obs.first("GUEST_EXIT").and_then(|e| e.i64("rc")),
+        Some(0),
+        "a close that only reports EINTR is not a failure"
+    );
+
+    // The saved file is exactly the delivered key with mode 0600, and the
+    // output is the usual success contract.
+    let on_disk = fs::read(&key).expect("key file must exist on success");
+    assert_eq!(on_disk.len(), KEY_LEN);
+    assert_eq!(on_disk, secret, "the saved key must be the delivered bytes");
+    assert_eq!(mode_of(&key), MODE_0600, "key file mode must be exactly 0600");
+    let (out, err) = guest_captured(&key);
+    assert!(err.is_empty(), "stderr must be empty on success: {err:?}");
+    assert_eq!(
+        out,
+        format!("Key saved to {}\n", key.display()).into_bytes()
+    );
+}
+
 
 // ---------------------------------------------------------------------------
 // tests: each scenario under both build profiles
@@ -796,5 +1198,41 @@ fn write_failure_after_full_key_zeroes_before_returning_under_both_profiles() {
     write_failure_after_full_key_still_wipes_the_full_key(&sup, &debug_bin(), "debug");
     if let Some(rel) = release_bin() {
         write_failure_after_full_key_still_wipes_the_full_key(&sup, &rel, "release");
+    }
+}
+
+#[test]
+fn close_failure_after_full_save_zeroes_before_reporting_under_both_profiles() {
+    let Some(sup) = support() else {
+        eprintln!("skipping: keylife/randtrap/permfail support unavailable");
+        return;
+    };
+    close_failure_after_full_save_still_wipes_the_full_key(&sup, &debug_bin(), "debug");
+    if let Some(rel) = release_bin() {
+        close_failure_after_full_save_still_wipes_the_full_key(&sup, &rel, "release");
+    }
+}
+
+#[test]
+fn close_failure_with_unlink_refused_zeroes_before_reporting_under_both_profiles() {
+    let Some(sup) = support() else {
+        eprintln!("skipping: keylife/randtrap/permfail support unavailable");
+        return;
+    };
+    close_failure_with_unlink_refused_still_wipes_the_full_key(&sup, &debug_bin(), "debug");
+    if let Some(rel) = release_bin() {
+        close_failure_with_unlink_refused_still_wipes_the_full_key(&sup, &rel, "release");
+    }
+}
+
+#[test]
+fn close_eintr_boundary_zeroes_before_success_report_under_both_profiles() {
+    let Some(sup) = support() else {
+        eprintln!("skipping: keylife/randtrap/permfail support unavailable");
+        return;
+    };
+    close_eintr_boundary_saves_and_wipes_before_the_report(&sup, &debug_bin(), "debug");
+    if let Some(rel) = release_bin() {
+        close_eintr_boundary_saves_and_wipes_before_the_report(&sup, &rel, "release");
     }
 }

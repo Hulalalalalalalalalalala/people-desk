@@ -42,7 +42,17 @@
  * Watch arm points: success  -> the key fd's close(2) exit;
  *                   randfail -> the emulated getrandom error visible after
  *                               SIGSYS handler rt_sigreturn;
- *                   writefail-> the key fd write(2) exit carrying EIO.
+ *                   writefail-> the key fd write(2) exit carrying EIO;
+ *                   closefail-> the key fd's close(2) exit. The permfail
+ *                               shim reports the close error in user space
+ *                               after really releasing the descriptor, so
+ *                               the close syscall itself succeeds; the
+ *                               failed save then reaches abort_save, whose
+ *                               unlinkat(2) of this run's file is observed
+ *                               while stepping and must still see the full
+ *                               key (when the shim also refuses the unlink
+ *                               in user space no unlinkat syscall happens,
+ *                               so that event is simply absent).
  *
  * Partial-draw failure needs one extra trick. When the random source dries
  * up after `held` (< 32) bytes, the remaining 32-held slots have never been
@@ -61,6 +71,7 @@
  *   EVENT name=WRITE_BORROWS fd=N held=32
  *   EVENT name=CLOSE_STILL_HELD fd=N held=32
  *   EVENT name=WRITE_FAILED held=32
+ *   EVENT name=ABORT_UNLINK fd=N held=32
  *   EVENT name=RANDOM_FAILED held=N sentinel=M
  *   EVENT name=WIPED held=N sentinel=M steps=K
  *   EVENT name=OUTPUT_AFTER_WIPE fd=N
@@ -179,7 +190,7 @@ static int is_syscall_insn_word(uint32_t insn)
  * FAIL instead of single-stepping all the way to process exit. */
 #define WIPE_STEP_BUDGET 2000000L
 
-enum mode { MODE_SUCCESS, MODE_RANDFAIL, MODE_WRITEFAIL };
+enum mode { MODE_SUCCESS, MODE_RANDFAIL, MODE_WRITEFAIL, MODE_CLOSEFAIL };
 
 struct observer {
     pid_t pid;
@@ -209,7 +220,7 @@ struct observer {
 static void die_usage(void)
 {
     fprintf(stderr,
-        "usage: keylife <success|randfail|writefail> <stdout-cap>"
+        "usage: keylife <success|randfail|writefail|closefail> <stdout-cap>"
         " <stderr-cap> -- <guest> [args...]\n");
     exit(2);
 }
@@ -508,7 +519,10 @@ static void on_syscall_exit(struct observer *o,
     case SYS_close:
         if (o->phase == 2 && o->keyfd >= 0 &&
             (long)o->entry_a0 == (long)o->keyfd && !iserr) {
-            if (o->mode == MODE_SUCCESS) {
+            if (o->mode == MODE_SUCCESS || o->mode == MODE_CLOSEFAIL) {
+                /* closefail: the close *syscall* succeeds -- the permfail
+                 * shim reports the unrecoverable close error in user space
+                 * afterwards, so this is also the failed-close arm point. */
                 require_still_holds_full_key(o, "CLOSE_STILL_HELD",
                                             (long)o->keyfd);
             } else if (o->mode == MODE_WRITEFAIL && o->abort_unlink_seen) {
@@ -519,7 +533,7 @@ static void on_syscall_exit(struct observer *o,
                                             (long)o->keyfd);
             }
             if (!o->failed &&
-                ((o->mode == MODE_SUCCESS) ||
+                ((o->mode == MODE_SUCCESS) || (o->mode == MODE_CLOSEFAIL) ||
                  (o->mode == MODE_WRITEFAIL && o->abort_unlink_seen))) {
                 o->phase = 4;
                 o->held = KEYN;
@@ -643,6 +657,26 @@ static int watch_step(struct observer *o, int sig,
 
     long fd = -1;
     long nr = pending_syscall(o, sig, si, g, &fd);
+
+    /* closefail: after the failed close the save reaches abort_save, whose
+     * first step is unlinking this invocation's file. At that moment the
+     * complete key must still be in the buffer: the wipe is only allowed
+     * afterwards, on the way out of the operation. (When the shim refuses
+     * the unlink in user space no unlinkat syscall happens at all, so this
+     * event is simply absent from that run.) */
+    if (o->mode == MODE_CLOSEFAIL && nr == SYS_unlinkat &&
+        !o->abort_unlink_seen) {
+        if (memcmp(cur, o->secret, KEYN) != 0) {
+            set_fail(o,
+                     "abort unlink: key buffer changed before the save "
+                     "finished");
+            return 0;
+        }
+        o->abort_unlink_seen = 1;
+        printf("EVENT name=ABORT_UNLINK fd=%d held=%d\n", o->keyfd, KEYN);
+        fflush(stdout);
+    }
+
     if ((nr == SYS_write || nr == SYS_writev) && (fd == 1 || fd == 2)) {
         if (!all_zero(cur, KEYN)) {
             set_fail(o,
@@ -710,6 +744,8 @@ int main(int argc, char **argv)
         mode = MODE_RANDFAIL;
     else if (!strcmp(argv[1], "writefail"))
         mode = MODE_WRITEFAIL;
+    else if (!strcmp(argv[1], "closefail"))
+        mode = MODE_CLOSEFAIL;
     else
         die_usage();
     const char *out_cap = argv[2];
@@ -858,6 +894,8 @@ int main(int argc, char **argv)
             set_fail(&o, "randfail path never planted the tail sentinel");
         } else if (mode == MODE_WRITEFAIL && o.keyfd < 0) {
             set_fail(&o, "writefail path never opened the key file");
+        } else if (mode == MODE_CLOSEFAIL && o.keyfd < 0) {
+            set_fail(&o, "closefail path never opened the key file");
         }
     }
 
