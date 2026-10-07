@@ -53,6 +53,22 @@
  *                               key (when the shim also refuses the unlink
  *                               in user space no unlinkat syscall happens,
  *                               so that event is simply absent).
+ *                   permfail -> abort_save's unlinkat(2) entry. The
+ *                               permission failure itself (fchmod/fstat
+ *                               rejected) is injected in user space by the
+ *                               permfail shim, and the save aborts before
+ *                               any key byte is written, so the cleanup
+ *                               unlink is the first observable syscall of
+ *                               the failed save; it must still see the
+ *                               full key, as must the abort's close(2)
+ *                               while stepping.
+ *
+ * The permfail mode never sees a key write, so the key fd cannot be
+ * identified by write content; it is instead the descriptor the guest
+ * itself opens with O_CREAT|O_EXCL after the fill completes (the shims'
+ * own trace-file opens use O_APPEND without O_EXCL, and the runtime's
+ * opens precede the fill). Any write(2) to that fd is a hard failure:
+ * no key byte may reach a file whose permissions could not be guaranteed.
  *
  * Partial-draw failure needs one extra trick. When the random source dries
  * up after `held` (< 32) bytes, the remaining 32-held slots have never been
@@ -72,6 +88,7 @@
  *   EVENT name=CLOSE_STILL_HELD fd=N held=32
  *   EVENT name=WRITE_FAILED held=32
  *   EVENT name=ABORT_UNLINK fd=N held=32
+ *   EVENT name=ABORT_CLOSE_STILL_HELD fd=N held=32
  *   EVENT name=RANDOM_FAILED held=N sentinel=M
  *   EVENT name=WIPED held=N sentinel=M steps=K
  *   EVENT name=OUTPUT_AFTER_WIPE fd=N
@@ -190,7 +207,8 @@ static int is_syscall_insn_word(uint32_t insn)
  * FAIL instead of single-stepping all the way to process exit. */
 #define WIPE_STEP_BUDGET 2000000L
 
-enum mode { MODE_SUCCESS, MODE_RANDFAIL, MODE_WRITEFAIL, MODE_CLOSEFAIL };
+enum mode { MODE_SUCCESS, MODE_RANDFAIL, MODE_WRITEFAIL, MODE_CLOSEFAIL,
+            MODE_PERMFAIL };
 
 struct observer {
     pid_t pid;
@@ -204,6 +222,7 @@ struct observer {
     uint8_t secret[KEYN];       /* observed full key (once filled) */
     int keyfd;                  /* fd of the key file, or -1 */
     int abort_unlink_seen;      /* abort_save's unlink after a failed save */
+    int abort_close_seen;       /* abort_save's close after a failed save */
     int output_after_wipe;
     int fill_req32_seen;
     int wipe_reported;
@@ -220,8 +239,8 @@ struct observer {
 static void die_usage(void)
 {
     fprintf(stderr,
-        "usage: keylife <success|randfail|writefail|closefail> <stdout-cap>"
-        " <stderr-cap> -- <guest> [args...]\n");
+        "usage: keylife <success|randfail|writefail|closefail|permfail>"
+        " <stdout-cap> <stderr-cap> -- <guest> [args...]\n");
     exit(2);
 }
 
@@ -465,8 +484,18 @@ static void on_syscall_entry(struct observer *o,
         /* Every offer of key bytes to the key fd must borrow the still-live
          * full key (checked at the buffer's own address, not the offer
          * pointer, so short writes with advancing pointers are covered). */
-        if (o->phase >= 2 && o->keyfd >= 0 && fd == (long)o->keyfd)
+        if (o->phase >= 2 && o->keyfd >= 0 && fd == (long)o->keyfd) {
+            /* permfail: the save aborts before any key byte is written, so
+             * the key fd must never see a write at all. */
+            if (o->mode == MODE_PERMFAIL) {
+                set_fail(o,
+                         "permfail path wrote to the key fd (fd=%ld) even "
+                         "though the permissions could not be guaranteed",
+                         fd);
+                return;
+            }
             require_still_holds_full_key(o, "WRITE_BORROWS", fd);
+        }
     }
 
     if (nr == SYS_unlinkat) {
@@ -484,6 +513,23 @@ static void on_syscall_entry(struct observer *o,
                 printf("EVENT name=ABORT_UNLINK fd=%d held=%d\n", o->keyfd,
                        KEYN);
                 fflush(stdout);
+            }
+        }
+        /* permfail mode: the permission failure (fchmod/fstat rejected) is
+         * injected in user space by the permfail shim and the save aborts
+         * before any key byte is written, so abort_save's unlink of this
+         * run's file is the first observable syscall of the failed save.
+         * The full key must still be held here; the wipe is only allowed
+         * afterwards, on the way out. */
+        if (o->mode == MODE_PERMFAIL && o->phase == 2 &&
+            o->keyfd >= 0 && !o->abort_unlink_seen) {
+            require_still_holds_full_key(o, "ABORT_UNLINK", (long)o->keyfd);
+            if (!o->failed) {
+                o->abort_unlink_seen = 1;
+                o->phase = 4;
+                o->held = KEYN;
+                o->sentinel = 0;
+                o->wipe_steps = 0;
             }
         }
     }
@@ -504,9 +550,20 @@ static void on_syscall_exit(struct observer *o,
         break;
 
     case SYS_openat:
-        /* The key fd is identified by the content of the first key write
-         * (see on_syscall_entry), not by fd number, so openat needs no
-         * tracking here. */
+        /* In the content-identifying modes the key fd is learned from the
+         * first key write (see on_syscall_entry), not by fd number, so
+         * openat needs no tracking there. In permfail mode no key byte is
+         * ever written, so the key fd is identified here instead: the
+         * descriptor the guest itself creates with O_CREAT|O_EXCL after the
+         * fill completes. The shims' trace files are opened with O_APPEND
+         * (no O_EXCL) and the runtime's own opens precede the fill, so the
+         * first such openat is the key file. */
+        if (o->mode == MODE_PERMFAIL && o->phase == 2 && o->keyfd < 0 &&
+            !iserr && rval >= 0 &&
+            (o->entry_a2 & (uint64_t)(O_CREAT | O_EXCL)) ==
+                (uint64_t)(O_CREAT | O_EXCL)) {
+            o->keyfd = (int)rval;
+        }
         break;
 
     case SYS_write:
@@ -677,6 +734,24 @@ static int watch_step(struct observer *o, int sig,
         fflush(stdout);
     }
 
+    /* permfail: the wipe watch was armed at the abort's unlinkat entry, so
+     * the abort's close of the key fd happens while stepping. The complete
+     * key must still be in the buffer at that point: the wipe is only
+     * allowed afterwards, on the way out of the operation. */
+    if (o->mode == MODE_PERMFAIL && nr == SYS_close &&
+        fd == (long)o->keyfd && !o->abort_close_seen) {
+        if (memcmp(cur, o->secret, KEYN) != 0) {
+            set_fail(o,
+                     "abort close: key buffer changed before the save "
+                     "finished");
+            return 0;
+        }
+        o->abort_close_seen = 1;
+        printf("EVENT name=ABORT_CLOSE_STILL_HELD fd=%d held=%d\n", o->keyfd,
+               KEYN);
+        fflush(stdout);
+    }
+
     if ((nr == SYS_write || nr == SYS_writev) && (fd == 1 || fd == 2)) {
         if (!all_zero(cur, KEYN)) {
             set_fail(o,
@@ -746,6 +821,8 @@ int main(int argc, char **argv)
         mode = MODE_WRITEFAIL;
     else if (!strcmp(argv[1], "closefail"))
         mode = MODE_CLOSEFAIL;
+    else if (!strcmp(argv[1], "permfail"))
+        mode = MODE_PERMFAIL;
     else
         die_usage();
     const char *out_cap = argv[2];
@@ -896,6 +973,10 @@ int main(int argc, char **argv)
             set_fail(&o, "writefail path never opened the key file");
         } else if (mode == MODE_CLOSEFAIL && o.keyfd < 0) {
             set_fail(&o, "closefail path never opened the key file");
+        } else if (mode == MODE_PERMFAIL && o.keyfd < 0) {
+            set_fail(&o, "permfail path never opened the key file");
+        } else if (mode == MODE_PERMFAIL && !o.abort_close_seen) {
+            set_fail(&o, "permfail path never closed the key file");
         }
     }
 
