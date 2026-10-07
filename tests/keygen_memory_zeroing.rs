@@ -26,7 +26,8 @@
 //! syscall, reads it across the file operations, and single-steps the guest
 //! after the save (success -- including a close that merely reports EINTR),
 //! after the emulated random-source failure, after a mid-save write failure,
-//! and after an unrecoverable close error (with the cleanup both allowed
+//! after a permission setup (fchmod) or confirmation (fstat) failure, and
+//! after an unrecoverable close error (with the cleanup both allowed
 //! and refused) to watch the whole buffer become zero before the first
 //! stdout/stderr write. For a partial-draw failure it also plants a
 //! non-zero sentinel in the slots the random source never delivered (those
@@ -35,8 +36,8 @@
 //!
 //! The random source is made deterministic and fail-able by the existing
 //! randtrap shim (fixed 0x80.. byte pattern; seccomp SIGSYS emulation), and
-//! the write failure by the existing permfail shim. Nothing in the product
-//! changes.
+//! the write, close, and permission-stage failures by the existing permfail
+//! shim. Nothing in the product changes.
 //!
 //! Every scenario is run against the debug binary (`CARGO_BIN_EXE_wrapfile`)
 //! and a freshly built `--release` binary, since an optimizer deleting a
@@ -828,6 +829,191 @@ fn write_failure_after_full_key_still_wipes_the_full_key(
     assert_eq!(mode_of(&tmp.path), parent_before, "parent mode must survive");
 }
 
+/// Shared driver for the two permission-failure scenarios: the filesystem
+/// refuses to set (fchmod) or confirm (fstat) the required 0600 after the
+/// full key has been drawn but before any key byte is written. The observer
+/// must see the complete non-zero key still held in the very buffer the
+/// random source filled, through the abort cleanup (unlink of this run's
+/// file and close of its descriptor), and then wiped before the first
+/// failure-report byte -- i.e. before the keygen operation returns.
+fn perm_failure_after_full_key_still_wipes_the_full_key(
+    sup: &Support,
+    bin: &Path,
+    profile: &str,
+    scenario: &str,
+    fault_env: &str,
+    stage_stderr: &str,
+    other_stage_stderr: &str,
+) {
+    let tmp = Tmp::new(&format!("{scenario}-{profile}"));
+    let key = tmp.child("key");
+    let (sib, sib_bytes, sib_mode) = make_sibling(&tmp.path);
+    let parent_before = mode_of(&tmp.path);
+    let trace = tmp.child("trace.log");
+    fs::File::create(&trace).unwrap();
+    fs::set_permissions(&trace, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // The key draw succeeds completely (the failure hits only afterwards);
+    // the permfail shim then refuses the permission stage in user space,
+    // after the target was created but before any key byte could be written.
+    let obs = observe(
+        &sup.observer,
+        bin,
+        scenario,
+        &key,
+        &[sup.randtrap.clone(), sup.permfail.clone()],
+        &[
+            ("WRAPFILE_TEST_GETRANDOM_PARTIAL", "8"),
+            (fault_env, "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+        &trace,
+    );
+    if !observer_ran(&obs) {
+        return;
+    }
+    if !trap_armed(&trace) {
+        eprintln!("skipping: randtrap seccomp trap did not arm here");
+        return;
+    }
+    assert_eq!(
+        obs.rc, 0,
+        "[{profile}] observer must confirm the wipe, got FAIL: {:?}",
+        obs.fail.clone()
+    );
+
+    // The scenario really reached the intended permission-failure stage:
+    // the shim trace shows the injected refusal (and, for the confirmation
+    // stage, that the fchmod itself succeeded first)...
+    let shim = shim_events(&trace);
+    match scenario {
+        "chmodfail" => assert!(
+            shim_event_seen(&shim, "FCHMOD", "ret", "-1"),
+            "the fchmod failure must have been injected"
+        ),
+        "statfail" => {
+            assert!(
+                shim_event_seen(&shim, "FCHMOD", "ret", "0"),
+                "the fchmod must have succeeded before the confirmation"
+            );
+            assert!(
+                shim_event_seen(&shim, "FSTAT", "ret", "-1"),
+                "the fstat failure must have been injected"
+            );
+        }
+        other => panic!("unknown permission-failure scenario {other}"),
+    }
+    // ...and no key byte was ever offered to the target file.
+    assert!(
+        shim.iter().all(|e| e.kind != "WRITE" && e.kind != "FIRST_WRITE"),
+        "no key byte may be written when the permissions cannot be guaranteed"
+    );
+
+    // The full, non-zero key really was delivered into the buffer the
+    // observer watches -- the buffer the save code itself holds.
+    let secret = obs.secret();
+    assert_eq!(secret.len(), KEY_LEN);
+    assert!(
+        secret.iter().all(|&b| b != 0),
+        "the held key must consist of non-zero delivered bytes"
+    );
+    let delivered = key_fill_bytes(&getrandom_events(&trace));
+    assert_eq!(delivered.len(), KEY_LEN);
+    assert_eq!(secret, delivered, "observed buffer bytes must equal delivery");
+
+    // That same buffer still held the full key when the abort cleanup
+    // unlinked this run's file and closed its descriptor...
+    assert!(
+        obs.first("ABORT_UNLINK").is_some(),
+        "the cleanup unlink must still see the full key"
+    );
+    assert!(
+        obs.first("ABORT_CLOSE_STILL_HELD").is_some(),
+        "the cleanup close must still see the full key"
+    );
+
+    // ...and was then wiped in a tight local loop, after the cleanup and
+    // before the first failure-report byte.
+    let wiped = obs.first("WIPED").expect("WIPED event");
+    assert_eq!(wiped.usize("held"), Some(KEY_LEN));
+    assert_eq!(wiped.usize("sentinel"), Some(0));
+    let steps = wiped.i64("steps").expect("WIPED steps=");
+    assert!(
+        (1..1_000_000).contains(&steps),
+        "wipe must be a small bounded local loop, got {steps} steps"
+    );
+    let i_unlink = obs.index("ABORT_UNLINK").unwrap();
+    let i_close = obs.index("ABORT_CLOSE_STILL_HELD").unwrap();
+    let i_wiped = obs.index("WIPED").unwrap();
+    let i_output = obs
+        .index("OUTPUT_AFTER_WIPE")
+        .expect("the failure report must be observed after the wipe");
+    assert!(i_unlink < i_close, "the cleanup close must follow the unlink");
+    assert!(i_close < i_wiped, "wipe must follow the abort cleanup");
+    assert!(i_wiped < i_output, "wipe must precede the failure report");
+    assert_eq!(
+        obs.first("GUEST_EXIT").and_then(|e| e.i64("rc")),
+        Some(1),
+        "a permission failure must fail the save"
+    );
+
+    // Public failure behavior: exit 1, empty stdout, stderr names the
+    // target and identifies *this* permission stage (never the other one);
+    // this run's empty file is gone; the key leaks nowhere.
+    assert!(!key.exists(), "the file from the failed save must be removed");
+    let (out, err) = guest_captured(&key);
+    assert!(out.is_empty(), "no success message on failure");
+    let err_text = String::from_utf8_lossy(&err);
+    assert!(
+        err_text.contains(stage_stderr),
+        "stderr must name the permission stage that failed: {err_text}"
+    );
+    assert!(
+        !err_text.contains(other_stage_stderr),
+        "stderr must not blame the other permission stage: {err_text}"
+    );
+    assert!(
+        err_text.contains(&key.display().to_string()),
+        "stderr must name the target: {err_text}"
+    );
+    assert_key_not_leaked(&out, &err, &secret);
+
+    assert_sentinel_untouched(&sib, &sib_bytes, sib_mode);
+    assert_eq!(mode_of(&tmp.path), parent_before, "parent mode must survive");
+}
+
+fn chmod_failure_after_full_key_still_wipes_the_full_key(
+    sup: &Support,
+    bin: &Path,
+    profile: &str,
+) {
+    perm_failure_after_full_key_still_wipes_the_full_key(
+        sup,
+        bin,
+        profile,
+        "chmodfail",
+        "WRAPFILE_TEST_FAIL_FCHMOD",
+        "cannot set key file permissions to 0600",
+        "cannot verify key file permissions",
+    );
+}
+
+fn stat_failure_after_full_key_still_wipes_the_full_key(
+    sup: &Support,
+    bin: &Path,
+    profile: &str,
+) {
+    perm_failure_after_full_key_still_wipes_the_full_key(
+        sup,
+        bin,
+        profile,
+        "statfail",
+        "WRAPFILE_TEST_FAIL_FSTAT",
+        "cannot verify key file permissions are 0600",
+        "cannot set key file permissions",
+    );
+}
+
 /// Shared observer-side assertions for the two close-failure scenarios:
 /// the full non-zero key was delivered and borrowed through the save, the
 /// injected close fault really fired after a complete synced write, and the
@@ -1198,6 +1384,30 @@ fn write_failure_after_full_key_zeroes_before_returning_under_both_profiles() {
     write_failure_after_full_key_still_wipes_the_full_key(&sup, &debug_bin(), "debug");
     if let Some(rel) = release_bin() {
         write_failure_after_full_key_still_wipes_the_full_key(&sup, &rel, "release");
+    }
+}
+
+#[test]
+fn chmod_failure_after_full_key_zeroes_before_returning_under_both_profiles() {
+    let Some(sup) = support() else {
+        eprintln!("skipping: keylife/randtrap/permfail support unavailable");
+        return;
+    };
+    chmod_failure_after_full_key_still_wipes_the_full_key(&sup, &debug_bin(), "debug");
+    if let Some(rel) = release_bin() {
+        chmod_failure_after_full_key_still_wipes_the_full_key(&sup, &rel, "release");
+    }
+}
+
+#[test]
+fn stat_failure_after_full_key_zeroes_before_returning_under_both_profiles() {
+    let Some(sup) = support() else {
+        eprintln!("skipping: keylife/randtrap/permfail support unavailable");
+        return;
+    };
+    stat_failure_after_full_key_still_wipes_the_full_key(&sup, &debug_bin(), "debug");
+    if let Some(rel) = release_bin() {
+        stat_failure_after_full_key_still_wipes_the_full_key(&sup, &rel, "release");
     }
 }
 

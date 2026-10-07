@@ -53,6 +53,23 @@
  *                               key (when the shim also refuses the unlink
  *                               in user space no unlinkat syscall happens,
  *                               so that event is simply absent).
+ *                   chmodfail-> the permfail shim rejects fchmod(0600) in
+ *                               user space (EPERM, no syscall); the abort
+ *                               cleanup's unlinkat(2) is the first
+ *                               observable syscall afterwards and must
+ *                               still see the full key, as must the abort's
+ *                               close(2) of the key fd, whose exit arms the
+ *                               wipe watch.
+ *                   statfail -> the fchmod succeeded but the shim fails the
+ *                               confirming fstat in user space (EBADF) after
+ *                               really performing it; from there on the
+ *                               sequence is identical to chmodfail.
+ *
+ * chmodfail/statfail never reach a key write, so the key fd cannot be
+ * identified by the content of a write(2): it is the descriptor the guest
+ * itself creates with openat(O_CREAT|O_EXCL) after the fill completed (the
+ * shims open their trace file without O_EXCL, and the runtime's own opens
+ * all precede the fill, so this identifies exactly the key file).
  *
  * Partial-draw failure needs one extra trick. When the random source dries
  * up after `held` (< 32) bytes, the remaining 32-held slots have never been
@@ -72,6 +89,7 @@
  *   EVENT name=CLOSE_STILL_HELD fd=N held=32
  *   EVENT name=WRITE_FAILED held=32
  *   EVENT name=ABORT_UNLINK fd=N held=32
+ *   EVENT name=ABORT_CLOSE_STILL_HELD fd=N held=32
  *   EVENT name=RANDOM_FAILED held=N sentinel=M
  *   EVENT name=WIPED held=N sentinel=M steps=K
  *   EVENT name=OUTPUT_AFTER_WIPE fd=N
@@ -190,7 +208,8 @@ static int is_syscall_insn_word(uint32_t insn)
  * FAIL instead of single-stepping all the way to process exit. */
 #define WIPE_STEP_BUDGET 2000000L
 
-enum mode { MODE_SUCCESS, MODE_RANDFAIL, MODE_WRITEFAIL, MODE_CLOSEFAIL };
+enum mode { MODE_SUCCESS, MODE_RANDFAIL, MODE_WRITEFAIL, MODE_CLOSEFAIL,
+            MODE_CHMODFAIL, MODE_STATFAIL };
 
 struct observer {
     pid_t pid;
@@ -220,8 +239,8 @@ struct observer {
 static void die_usage(void)
 {
     fprintf(stderr,
-        "usage: keylife <success|randfail|writefail|closefail> <stdout-cap>"
-        " <stderr-cap> -- <guest> [args...]\n");
+        "usage: keylife <success|randfail|writefail|closefail|chmodfail|"
+        "statfail> <stdout-cap> <stderr-cap> -- <guest> [args...]\n");
     exit(2);
 }
 
@@ -486,6 +505,17 @@ static void on_syscall_entry(struct observer *o,
                 fflush(stdout);
             }
         }
+        /* chmodfail/statfail: the permission failure is reported by the
+         * permfail shim in user space, so abort_save's unlinkat is the
+         * first observable syscall of the abort. No key byte was ever
+         * written, yet the full key is already in the buffer and must
+         * still be there now -- the wipe is only allowed afterwards. */
+        if ((o->mode == MODE_CHMODFAIL || o->mode == MODE_STATFAIL) &&
+            o->phase == 2 && o->keyfd >= 0 && !o->abort_unlink_seen) {
+            require_still_holds_full_key(o, "ABORT_UNLINK", (long)o->keyfd);
+            if (!o->failed)
+                o->abort_unlink_seen = 1;
+        }
     }
 }
 
@@ -504,9 +534,18 @@ static void on_syscall_exit(struct observer *o,
         break;
 
     case SYS_openat:
-        /* The key fd is identified by the content of the first key write
-         * (see on_syscall_entry), not by fd number, so openat needs no
-         * tracking here. */
+        /* chmodfail/statfail: the save fails before any key byte is
+         * written, so the key fd cannot be recognized by the content of a
+         * write. It is instead the descriptor the guest itself creates with
+         * O_CREAT|O_EXCL after the fill completed -- the shims open their
+         * trace file without O_EXCL, and the runtime's own opens all
+         * precede the fill, so this identifies exactly the key file. */
+        if ((o->mode == MODE_CHMODFAIL || o->mode == MODE_STATFAIL) &&
+            o->phase == 2 && o->keyfd < 0 && !iserr && rval >= 0 &&
+            (o->entry_a2 & (uint64_t)(O_CREAT | O_EXCL)) ==
+                (uint64_t)(O_CREAT | O_EXCL)) {
+            o->keyfd = (int)rval;
+        }
         break;
 
     case SYS_write:
@@ -519,13 +558,20 @@ static void on_syscall_exit(struct observer *o,
     case SYS_close:
         if (o->phase == 2 && o->keyfd >= 0 &&
             (long)o->entry_a0 == (long)o->keyfd && !iserr) {
+            /* chmodfail/statfail (like writefail) reach this close from
+             * abort_save's cleanup after the unlink: the full key must
+             * still be present, and the wipe is only allowed afterwards. */
+            int abort_close =
+                (o->mode == MODE_WRITEFAIL || o->mode == MODE_CHMODFAIL ||
+                 o->mode == MODE_STATFAIL) &&
+                o->abort_unlink_seen;
             if (o->mode == MODE_SUCCESS || o->mode == MODE_CLOSEFAIL) {
                 /* closefail: the close *syscall* succeeds -- the permfail
                  * shim reports the unrecoverable close error in user space
                  * afterwards, so this is also the failed-close arm point. */
                 require_still_holds_full_key(o, "CLOSE_STILL_HELD",
                                             (long)o->keyfd);
-            } else if (o->mode == MODE_WRITEFAIL && o->abort_unlink_seen) {
+            } else if (abort_close) {
                 /* abort_save unlinked first and now closes the still-open
                  * key fd; the full key must still be present at this point
                  * and wiped only afterwards, on the way out. */
@@ -533,8 +579,8 @@ static void on_syscall_exit(struct observer *o,
                                             (long)o->keyfd);
             }
             if (!o->failed &&
-                ((o->mode == MODE_SUCCESS) || (o->mode == MODE_CLOSEFAIL) ||
-                 (o->mode == MODE_WRITEFAIL && o->abort_unlink_seen))) {
+                (o->mode == MODE_SUCCESS || o->mode == MODE_CLOSEFAIL ||
+                 abort_close)) {
                 o->phase = 4;
                 o->held = KEYN;
                 o->sentinel = 0;
@@ -746,6 +792,10 @@ int main(int argc, char **argv)
         mode = MODE_WRITEFAIL;
     else if (!strcmp(argv[1], "closefail"))
         mode = MODE_CLOSEFAIL;
+    else if (!strcmp(argv[1], "chmodfail"))
+        mode = MODE_CHMODFAIL;
+    else if (!strcmp(argv[1], "statfail"))
+        mode = MODE_STATFAIL;
     else
         die_usage();
     const char *out_cap = argv[2];
@@ -896,6 +946,13 @@ int main(int argc, char **argv)
             set_fail(&o, "writefail path never opened the key file");
         } else if (mode == MODE_CLOSEFAIL && o.keyfd < 0) {
             set_fail(&o, "closefail path never opened the key file");
+        } else if ((mode == MODE_CHMODFAIL || mode == MODE_STATFAIL) &&
+                   o.keyfd < 0) {
+            set_fail(&o, "permfail path never opened the key file");
+        } else if ((mode == MODE_CHMODFAIL || mode == MODE_STATFAIL) &&
+                   !o.abort_unlink_seen) {
+            set_fail(&o,
+                     "permfail path never reached the abort cleanup unlink");
         }
     }
 
