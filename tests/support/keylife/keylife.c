@@ -39,10 +39,29 @@
  *      covering only part of the buffer, and a wipe placed before the save
  *      are all FAILs.
  *
- * Watch arm points: success  -> the key fd's close(2) exit;
- *                   randfail -> the emulated getrandom error visible after
- *                               SIGSYS handler rt_sigreturn;
- *                   writefail-> the key fd write(2) exit carrying EIO.
+ * Watch arm points: success       -> the key fd's close(2) exit (success or
+ *                                    a mere EINTR report, which Linux still
+ *                                    treats as a completed save);
+ *                   randfail      -> the emulated getrandom error visible
+ *                                    after SIGSYS handler rt_sigreturn;
+ *                   writefail     -> the key fd write(2) exit carrying EIO;
+ *                   closefail     -> the abort unlink(2) entry that follows
+ *                                    the key fd close(2) reporting an
+ *                                    unrecoverable EIO, i.e. once the save is
+ *                                    known to have failed at the close stage
+ *                                    (the close-failed fd is already released
+ *                                    on Linux, so there is no abort close);
+ *                   closefail-nounlink -> the same point with the cleanup
+ *                                    unlink itself refused (EACCES).
+ *
+ * The close-stage scenarios pin down the one exit the other modes do not
+ * reach: all 32 bytes were written and fsynced, the on-disk file looks
+ * complete with mode 0600, yet close(2) reports EIO. The full key must still
+ * be in the one buffer while the close returns and while abort_save unlinks
+ * (or attempts to), and only then may the buffer be wiped, before the first
+ * failure line. The EINTR boundary is the other side of the same close: the
+ * descriptor is released and the save is reported successfully, so the wipe
+ * there must precede the success line just as in the plain success mode.
  *
  * Partial-draw failure needs one extra trick. When the random source dries
  * up after `held` (< 32) bytes, the remaining 32-held slots have never been
@@ -59,13 +78,27 @@
  *
  *   EVENT name=FILL_COMPLETE held=32 secret=<hex>
  *   EVENT name=WRITE_BORROWS fd=N held=32
- *   EVENT name=CLOSE_STILL_HELD fd=N held=32
- *   EVENT name=WRITE_FAILED held=32
+ *   EVENT name=CLOSE_STILL_HELD fd=N held=32   (every full-key save path)
+ *   EVENT name=CLOSE_FAILED held=32            (closefail: abort unlink)
+ *   EVENT name=WRITE_FAILED held=32            (writefail: abort unlink)
+ *   EVENT name=ABORT_UNLINK fd=N held=32       (writefail / closefail)
+ *   EVENT name=ABORT_CLOSE_STILL_HELD fd=N held=32  (writefail only)
  *   EVENT name=RANDOM_FAILED held=N sentinel=M
  *   EVENT name=WIPED held=N sentinel=M steps=K
  *   EVENT name=OUTPUT_AFTER_WIPE fd=N
  *   EVENT name=GUEST_EXIT rc=N
  *   FAIL reason=...
+ *
+ * The injected close EIO/EINTR and the refused unlink live inside the
+ * permfail LD_PRELOAD shim, in userspace: the real close(2) syscall still
+ * returns 0 and a refused unlink never reaches unlinkat(2). They are
+ * therefore invisible to ptrace exactly as writefail's injected write EIO
+ * is; the Rust harness proves the faults themselves through permfail's own
+ * trace log, while this observer proves the buffer lifecycle around them
+ * (CLOSE_STILL_HELD at the close exit, CLOSE_FAILED at the abort unlink for
+ * the unlink-allowed close failure, and -- with no kernel-visible cleanup
+ * point to arm at -- the watch armed at the close exit when unlink is
+ * refused).
  *
  * Exit status: 0 = every property for the requested mode held; 1 = a
  * regression was observed (a FAIL line was printed); 2 = usage/environment
@@ -179,7 +212,21 @@ static int is_syscall_insn_word(uint32_t insn)
  * FAIL instead of single-stepping all the way to process exit. */
 #define WIPE_STEP_BUDGET 2000000L
 
-enum mode { MODE_SUCCESS, MODE_RANDFAIL, MODE_WRITEFAIL };
+enum mode {
+    MODE_SUCCESS,
+    MODE_RANDFAIL,
+    MODE_WRITEFAIL,
+    /* All 32 bytes written and fsynced, then the key fd close(2) reports
+     * an unrecoverable EIO: abort_save unlinks the file (allowed here). */
+    MODE_CLOSEFAIL,
+    /* Same close EIO, but the cleanup unlink is itself refused (EACCES):
+     * the full-key residue stays at the target and must not be reported
+     * as a saved key. */
+    MODE_CLOSEFAIL_NOUNLINK,
+    /* close(2) only reports EINTR after releasing the descriptor: not a
+     * failure -- the save completes and is reported successfully. */
+    MODE_CLOSE_EINTR,
+};
 
 struct observer {
     pid_t pid;
@@ -192,6 +239,7 @@ struct observer {
     int sentinel;               /* sentinel bytes planted in undelivered tail */
     uint8_t secret[KEYN];       /* observed full key (once filled) */
     int keyfd;                  /* fd of the key file, or -1 */
+    int close_seen;             /* key fd close(2) exit was observed */
     int abort_unlink_seen;      /* abort_save's unlink after a failed save */
     int output_after_wipe;
     int fill_req32_seen;
@@ -209,7 +257,8 @@ struct observer {
 static void die_usage(void)
 {
     fprintf(stderr,
-        "usage: keylife <success|randfail|writefail> <stdout-cap>"
+        "usage: keylife <success|randfail|writefail|closefail|"
+        "closefail-nounlink|close-eintr> <stdout-cap>"
         " <stderr-cap> -- <guest> [args...]\n");
     exit(2);
 }
@@ -459,20 +508,34 @@ static void on_syscall_entry(struct observer *o,
     }
 
     if (nr == SYS_unlinkat) {
-        /* writefail mode: the failed save (the permfail shim makes the libc
-         * write() return EIO without a syscall, so the failure itself is
-         * not a syscall-exit event) reaches abort_save, whose first step is
-         * unlinking this invocation's file. At that moment the complete key
-         * must still be in the buffer: the wipe is only allowed afterwards,
-         * on the way out of the operation. */
-        if (o->mode == MODE_WRITEFAIL && o->phase == 2 &&
-            o->keyfd >= 0 && !o->abort_unlink_seen) {
-            require_still_holds_full_key(o, "WRITE_FAILED", (long)o->keyfd);
+        /* abort_save's unlink of this invocation's file. In writefail mode
+         * the key fd is still open and the permfail shim made the libc
+         * write() return EIO without a syscall, so this unlink entry is the
+         * first point at which the failed save is visible; in closefail
+         * mode the key fd close has already reported its injected EIO (the
+         * descriptor being released on Linux either way) and the unlink is
+         * the cleanup that follows. At that moment the complete key must
+         * still be in the buffer in both cases: the wipe is only allowed
+         * afterwards, on the way out of the operation. */
+        int writefail_abort =
+            o->mode == MODE_WRITEFAIL && o->phase == 2 &&
+            o->keyfd >= 0 && !o->abort_unlink_seen;
+        int closefail_abort =
+            o->mode == MODE_CLOSEFAIL && o->phase == 2 &&
+            o->keyfd >= 0 && o->close_seen && !o->abort_unlink_seen;
+        if (writefail_abort || closefail_abort) {
+            require_still_holds_full_key(
+                o, writefail_abort ? "WRITE_FAILED" : "CLOSE_FAILED",
+                (long)o->keyfd);
             if (!o->failed) {
                 o->abort_unlink_seen = 1;
                 printf("EVENT name=ABORT_UNLINK fd=%d held=%d\n", o->keyfd,
                        KEYN);
                 fflush(stdout);
+                /* The wipe watch arms at this unlink's *exit* (see
+                 * on_syscall_exit), mirroring writefail, which arms at the
+                 * abort close exit: the cleanup syscall itself then runs in
+                 * the usual syscall-stop mode rather than single-step. */
             }
         }
     }
@@ -498,6 +561,30 @@ static void on_syscall_exit(struct observer *o,
          * tracking here. */
         break;
 
+    case SYS_unlinkat:
+        /* closefail with the cleanup allowed: unlike writefail (whose fd
+         * is still open and which arms at the following abort close
+         * exit), the close-stage failure released the key fd already, so
+         * this unlink exit is the point after which the only thing left
+         * is building the error and wiping -- arm the watch here. The
+         * unlink-refused variant never issues this syscall (the refusal
+         * is synthesized in the shim); it armed at the close exit. */
+        if (o->mode == MODE_CLOSEFAIL && o->phase == 2 &&
+            o->keyfd >= 0 && o->close_seen && o->abort_unlink_seen) {
+            if (iserr) {
+                set_fail(o,
+                         "closefail abort unlink failed at the kernel "
+                         "(ret=%ld): harness must leave cleanup allowed",
+                         rval);
+                break;
+            }
+            o->phase = 4;
+            o->held = KEYN;
+            o->sentinel = 0;
+            o->wipe_steps = 0;
+        }
+        break;
+
     case SYS_write:
     case SYS_writev:
         /* The write failure itself is injected inside libc by the permfail
@@ -508,19 +595,41 @@ static void on_syscall_exit(struct observer *o,
     case SYS_close:
         if (o->phase == 2 && o->keyfd >= 0 &&
             (long)o->entry_a0 == (long)o->keyfd && !iserr) {
-            if (o->mode == MODE_SUCCESS) {
+            o->close_seen = 1;
+            /* The key fd close exit. The injected EIO/EINTR report is
+             * produced by the permfail shim in userspace on top of this
+             * successful syscall (Linux releases the descriptor either
+             * way), so the kernel-visible exit alone cannot say which
+             * scenario this is -- the mode selects that, and the Rust
+             * harness corroborates the injected errno from the shim trace.
+             *
+             * What this point means per mode:
+             *  - success / close EINTR: the completed save's final close;
+             *  - close EIO with unlink allowed: the last file operation
+             *    before abort_save unlinks (the wipe watch arms at that
+             *    unlink entry, so the full key is also proven held there);
+             *  - close EIO with unlink refused: the refusal happens inside
+             *    the shim with no unlinkat(2), so this exit is the last
+             *    kernel-visible point and the arm point;
+             *  - write failure: abort_save unlinked first and only now
+             *    closes the still-open fd. */
+            int arm_here = 0;
+            if (o->mode == MODE_SUCCESS || o->mode == MODE_CLOSE_EINTR) {
                 require_still_holds_full_key(o, "CLOSE_STILL_HELD",
                                             (long)o->keyfd);
+                arm_here = 1;
+            } else if (o->mode == MODE_CLOSEFAIL ||
+                       o->mode == MODE_CLOSEFAIL_NOUNLINK) {
+                require_still_holds_full_key(o, "CLOSE_STILL_HELD",
+                                            (long)o->keyfd);
+                if (o->mode == MODE_CLOSEFAIL_NOUNLINK)
+                    arm_here = 1;
             } else if (o->mode == MODE_WRITEFAIL && o->abort_unlink_seen) {
-                /* abort_save unlinked first and now closes the still-open
-                 * key fd; the full key must still be present at this point
-                 * and wiped only afterwards, on the way out. */
                 require_still_holds_full_key(o, "ABORT_CLOSE_STILL_HELD",
                                             (long)o->keyfd);
+                arm_here = 1;
             }
-            if (!o->failed &&
-                ((o->mode == MODE_SUCCESS) ||
-                 (o->mode == MODE_WRITEFAIL && o->abort_unlink_seen))) {
+            if (!o->failed && arm_here) {
                 o->phase = 4;
                 o->held = KEYN;
                 o->sentinel = 0;
@@ -710,6 +819,12 @@ int main(int argc, char **argv)
         mode = MODE_RANDFAIL;
     else if (!strcmp(argv[1], "writefail"))
         mode = MODE_WRITEFAIL;
+    else if (!strcmp(argv[1], "closefail"))
+        mode = MODE_CLOSEFAIL;
+    else if (!strcmp(argv[1], "closefail-nounlink"))
+        mode = MODE_CLOSEFAIL_NOUNLINK;
+    else if (!strcmp(argv[1], "close-eintr"))
+        mode = MODE_CLOSE_EINTR;
     else
         die_usage();
     const char *out_cap = argv[2];
@@ -858,6 +973,31 @@ int main(int argc, char **argv)
             set_fail(&o, "randfail path never planted the tail sentinel");
         } else if (mode == MODE_WRITEFAIL && o.keyfd < 0) {
             set_fail(&o, "writefail path never opened the key file");
+        } else if ((mode == MODE_CLOSEFAIL ||
+                    mode == MODE_CLOSEFAIL_NOUNLINK ||
+                    mode == MODE_CLOSE_EINTR) &&
+                   o.keyfd < 0) {
+            set_fail(&o, "close-stage path never opened the key file");
+        } else if (!o.close_seen &&
+                   (mode == MODE_CLOSEFAIL ||
+                    mode == MODE_CLOSEFAIL_NOUNLINK ||
+                    mode == MODE_CLOSE_EINTR)) {
+            set_fail(&o, "close-stage path never reached the key fd close");
+        } else if (mode == MODE_CLOSEFAIL && !o.abort_unlink_seen) {
+            set_fail(&o,
+                     "close EIO must reach abort_save's unlink while the "
+                     "full key is still held");
+        } else {
+            /* The wipe ordering is mode-independent; the public exit code
+             * is mode-specific and is pinned here as well as by the Rust
+             * harness: EINTR and plain success exit 0; every unrecoverable
+             * failure -- including the close-stage ones -- exits 1. */
+            int want0 = (mode == MODE_SUCCESS || mode == MODE_CLOSE_EINTR);
+            if (want0 ? guest_rc != 0 : guest_rc != 1) {
+                set_fail(&o,
+                         "guest exit code %d does not match the scenario",
+                         guest_rc);
+            }
         }
     }
 
@@ -866,6 +1006,5 @@ int main(int argc, char **argv)
         waitpid(pid, &status, 0);
     }
 
-    (void)guest_rc;
     return o.failed ? 1 : 0;
 }

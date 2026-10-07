@@ -24,12 +24,24 @@
 //! LD_PRELOAD shim): it forks, its child PTRACE_TRACEME's itself and execs
 //! wrapfile, and the observer locates the 32-byte buffer at the getrandom
 //! syscall, reads it across the file operations, and single-steps the guest
-//! after the save (success), after the emulated random-source failure, and
-//! after a mid-save write failure to watch the whole buffer become zero
+//! after the save (success, including a close that merely reports EINTR),
+//! after the emulated random-source failure, after a mid-save write
+//! failure, and after the close-stage failure (all 32 bytes written and
+//! fsynced, then close reports an unrecoverable EIO -- with the cleanup
+//! unlink allowed or itself refused) to watch the whole buffer become zero
 //! before the first stdout/stderr write. For a partial-draw failure it also
 //! plants a non-zero sentinel in the slots the random source never delivered
 //! (those slots stay zero from initialization), so a wipe covering only the
 //! delivered prefix is caught too.
+//!
+//! The close-stage cases close the one lifecycle gap the other exits leave:
+//! a close failure happens *after* the complete non-zero key has been
+//! written and synced into a file that looks complete (32 bytes, 0600), so
+//! they pin down that the full key really was held through the failing
+//! close and the cleanup that follows, and is only then fully zeroed before
+//! the failure report. The EINTR-on-close boundary is the same close's
+//! recoverable side: the descriptor is released, the save succeeds, and the
+//! same pre-success-report wipe must occur.
 //!
 //! The random source is made deterministic and fail-able by the existing
 //! randtrap shim (fixed 0x80.. byte pattern; seccomp SIGSYS emulation), and
@@ -375,6 +387,60 @@ fn key_fill_base(events: &[GrEvent]) -> usize {
         .rposition(|e| e.req == KEY_LEN)
         .map(|i| events[i].base)
         .expect("keygen must draw the 32 key bytes")
+}
+
+// ---------------------------------------------------------------------------
+// permfail shim trace helpers
+// ---------------------------------------------------------------------------
+
+/// One line of the permfail shim trace ("CLOSE ret=-1 errno=EIO", ...).
+/// The close EIO/EINTR and the refused unlink are synthesized by the shim
+/// in userspace (the real syscalls still succeed / never happen), so the
+/// ptrace observer cannot see the injected errno; the shim's own trace is
+/// what proves the fault the lifecycle was observed around.
+struct PfEvent {
+    kind: String,
+    attrs: HashMap<String, String>,
+}
+
+fn parse_pf_trace(path: &Path) -> Vec<PfEvent> {
+    let text = fs::read_to_string(path).unwrap();
+    text.lines()
+        .map(|line| {
+            let mut it = line.split_whitespace();
+            let kind = it.next().unwrap_or("").to_string();
+            let attrs = it
+                .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                .collect();
+            PfEvent { kind, attrs }
+        })
+        .collect()
+}
+
+/// True if the trace has a `kind` line (optionally carrying `errno=want`).
+fn pf_has(events: &[PfEvent], kind: &str, want_errno: Option<&str>) -> bool {
+    events.iter().any(|e| {
+        e.kind == kind
+            && want_errno.map_or(true, |want| {
+                e.attrs.get("errno").map(String::as_str) == Some(want)
+            })
+    })
+}
+
+/// Concatenate the bytes every successful key-fd WRITE actually landed, in
+/// trace order (requires WRAPFILE_TEST_TRACE_BYTES=1).
+fn pf_landed_bytes(events: &[PfEvent]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for e in events.iter().filter(|e| e.kind == "WRITE") {
+        let ret: i64 = e.attrs.get("ret").and_then(|v| v.parse().ok()).unwrap_or(0);
+        if ret <= 0 {
+            continue;
+        }
+        let hex = e.attrs.get("hex").map(String::as_str).expect("TRACE_BYTES must be on");
+        assert_eq!(hex.len() as i64, ret * 2, "traced hex length must match bytes landed");
+        out.extend((0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +824,414 @@ fn write_failure_after_full_key_still_wipes_the_full_key(
     assert_eq!(mode_of(&tmp.path), parent_before, "parent mode must survive");
 }
 
+// ---------------------------------------------------------------------------
+// close-stage scenarios
+// ---------------------------------------------------------------------------
+
+/// Shared proof for every full-key close-stage scenario (close EIO with the
+/// cleanup allowed or refused, and the recoverable close EINTR boundary):
+///
+///  1. a real non-zero 32-byte key really was delivered into the one buffer
+///     (and matches the randtrap trace byte for byte);
+///  2. the save used that same live key -- every key-fd write borrowed it
+///     intact, the permfail shim's own trace shows exactly those 32 bytes
+///     land and an fsync succeed, so an early wipe cannot have produced an
+///     all-zero or truncated file -- and the whole key was still in the
+///     buffer when the key-fd close returned;
+///  3. the whole 32-byte buffer was then wiped in a tight local loop before
+///     the first stdout/stderr write and before the operation returned.
+///
+/// Returns the observed key so each scenario can check its own file/output
+/// contract against it. The injected close EIO/EINTR is synthesized inside
+/// the permfail shim (the real close syscall returns 0), so `pf` -- the
+/// shim's own trace -- is what proves which close result was observed.
+fn assert_full_key_delivered_saved_then_wiped(
+    obs: &Observation,
+    rand_trace: &Path,
+    pf: &[PfEvent],
+    profile: &str,
+) -> Vec<u8> {
+    // (1) A real, non-zero, complete key was delivered into the one buffer.
+    let fill = obs.first("FILL_COMPLETE").expect("FILL_COMPLETE event");
+    assert_eq!(fill.usize("held"), Some(KEY_LEN));
+    let secret = obs.secret();
+    assert_eq!(secret.len(), KEY_LEN);
+    assert!(
+        secret.iter().all(|&b| b != 0),
+        "the held key must consist of non-zero delivered bytes"
+    );
+    let delivered = key_fill_bytes(&getrandom_events(rand_trace));
+    assert_eq!(delivered.len(), KEY_LEN);
+    assert_eq!(secret, delivered, "observed buffer bytes must equal delivery");
+
+    // (2) The save borrowed the still-live key. Each key-fd write offered
+    // the intact buffer, the shim saw exactly those bytes land (so they did
+    // reach the file and were not zeroed first), and they were synced
+    // before the close-stage result.
+    assert!(!obs.named("WRITE_BORROWS").is_empty(), "key writes must be seen");
+    let landed = pf_landed_bytes(pf);
+    assert_eq!(landed.len(), KEY_LEN, "all 32 bytes must land before the close");
+    assert_eq!(landed, secret, "the landed bytes must be the delivered key");
+    assert!(
+        pf.iter()
+            .any(|e| e.kind == "FSYNC" && e.attrs.get("ret").map(String::as_str) == Some("0")),
+        "[{profile}] the full key must have been fsynced before the close"
+    );
+    assert!(
+        obs.first("CLOSE_STILL_HELD").is_some(),
+        "the full key must still be held when the key fd close returns"
+    );
+
+    // (3) The whole buffer was wiped in a tight local loop, after the close
+    // and before the first report line.
+    let wiped = obs.first("WIPED").expect("WIPED event");
+    assert_eq!(wiped.usize("held"), Some(KEY_LEN));
+    assert_eq!(wiped.usize("sentinel"), Some(0));
+    let steps = wiped.i64("steps").expect("WIPED steps=");
+    assert!(
+        (1..1_000_000).contains(&steps),
+        "wipe must be a small bounded local loop, got {steps} steps"
+    );
+    assert!(
+        obs.index("CLOSE_STILL_HELD").unwrap() < obs.index("WIPED").unwrap(),
+        "wipe must follow the key fd close"
+    );
+    assert!(
+        obs.index("WIPED").unwrap()
+            < obs
+                .index("OUTPUT_AFTER_WIPE")
+                .expect("a post-wipe stdout/stderr write must be seen"),
+        "wipe must precede the report"
+    );
+
+    secret
+}
+
+/// Run a close-stage observation (shared setup), returning the observation
+/// after the usual skip checks (`None` when the observer cannot run or
+/// seccomp is unavailable here, so the caller skips). Both fault shims are
+/// preloaded and share one trace file, as in the write-failure scenario.
+fn run_close_scenario(
+    sup: &Support,
+    bin: &Path,
+    scenario: &str,
+    key: &Path,
+    trace: &Path,
+    env: &[(&str, &str)],
+) -> Option<Observation> {
+    let obs = observe(
+        &sup.observer,
+        bin,
+        scenario,
+        key,
+        &[sup.randtrap.clone(), sup.permfail.clone()],
+        env,
+        trace,
+    );
+    if !observer_ran(&obs) {
+        return None;
+    }
+    if !trap_armed(trace) {
+        eprintln!("skipping: randtrap seccomp trap did not arm here");
+        return None;
+    }
+    Some(obs)
+}
+
+/// All 32 bytes written and fsynced into a file that looks complete, then
+/// close reports an unrecoverable EIO and the cleanup is allowed: the full
+/// key must survive through the failing close and abort unlink and only
+/// then be wiped, before the failure report. Publicly this is exit 1,
+/// empty stdout, a close-failure message naming the target, and the file
+/// gone.
+fn close_error_after_full_key_wipes_then_removes_file(
+    sup: &Support,
+    bin: &Path,
+    profile: &str,
+) {
+    let tmp = Tmp::new(&format!("closefail-{profile}"));
+    let key = tmp.child("key");
+    let (sib, sib_bytes, sib_mode) = make_sibling(&tmp.path);
+    let parent_before = mode_of(&tmp.path);
+    let trace = tmp.child("trace.log");
+    fs::File::create(&trace).unwrap();
+    fs::set_permissions(&trace, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let Some(obs) = run_close_scenario(
+        sup,
+        bin,
+        "closefail",
+        &key,
+        &trace,
+        &[
+            ("WRAPFILE_TEST_GETRANDOM_PARTIAL", "8"),
+            ("WRAPFILE_TEST_FAIL_CLOSE", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+    ) else {
+        return;
+    };
+    assert_eq!(
+        obs.rc, 0,
+        "[{profile}] observer must confirm the wipe, got FAIL: {:?}",
+        obs.fail.clone()
+    );
+
+    // The faults themselves (invisible to ptrace) per the shim's own trace.
+    let pf = parse_pf_trace(&trace);
+    assert!(
+        pf_has(&pf, "CLOSE", Some("EIO")),
+        "the unrecoverable close EIO must have been injected"
+    );
+    assert!(
+        pf_has(&pf, "UNLINK", None) && !pf_has(&pf, "UNLINK", Some("EACCES")),
+        "the cleanup unlink must be attempted and allowed"
+    );
+
+    let secret = assert_full_key_delivered_saved_then_wiped(&obs, &trace, &pf, profile);
+
+    // The full key was still held at the abort unlink (the cleanup follows
+    // the close-stage failure); the wipe only followed that.
+    let i_close = obs.index("CLOSE_STILL_HELD").unwrap();
+    let i_failed = obs.index("CLOSE_FAILED").expect("CLOSE_FAILED event");
+    let i_unlink = obs.index("ABORT_UNLINK").expect("ABORT_UNLINK event");
+    let i_wiped = obs.index("WIPED").unwrap();
+    assert!(i_close < i_failed, "the full key must still be held when close reports EIO");
+    assert!(
+        i_failed <= i_unlink && i_unlink < i_wiped,
+        "wipe must follow the abort unlink, not the close alone"
+    );
+    assert_eq!(
+        obs.first("GUEST_EXIT").and_then(|e| e.i64("rc")),
+        Some(1)
+    );
+
+    // Public failure behavior: the completed-looking file is removed, exit
+    // 1, empty stdout, stderr explains the close-stage failure, names the
+    // target, and says the file was removed; the key leaks nowhere.
+    assert!(
+        !key.exists(),
+        "the completed-looking file must be removed after the close failure"
+    );
+    let (out, err) = guest_captured(&key);
+    assert!(out.is_empty(), "stdout must be empty on failure");
+    let err_text = String::from_utf8_lossy(&err);
+    assert!(
+        err_text.contains("closing the key file failed"),
+        "stderr must explain the close-stage failure: {err_text}"
+    );
+    assert!(
+        err_text.contains(&key.display().to_string()),
+        "stderr must name the target: {err_text}"
+    );
+    assert!(
+        err_text.contains("has been removed"),
+        "stderr must state the file this invocation created was removed: {err_text}"
+    );
+    assert!(
+        !err.windows(KEY_LEN).any(|w| w == secret.as_slice()),
+        "full key must not appear raw on stderr"
+    );
+    let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(!err_text.contains(&hex), "full key must not appear hex-encoded");
+
+    assert_sentinel_untouched(&sib, &sib_bytes, sib_mode);
+    assert_eq!(mode_of(&tmp.path), parent_before, "parent mode must survive");
+}
+
+/// Same unrecoverable close EIO, but the system also refuses the cleanup
+/// unlink (EACCES): the complete-looking 32-byte 0600 file stays at the
+/// target, yet it must not be reported as a saved key. The same in-memory
+/// contract holds -- the full key is wiped before the failure report -- and
+/// stderr keeps the close failure and additionally warns that cleanup did
+/// not finish and this run's file may remain.
+fn close_error_with_unlink_refused_still_wipes_full_key(
+    sup: &Support,
+    bin: &Path,
+    profile: &str,
+) {
+    let tmp = Tmp::new(&format!("closefail-nounlink-{profile}"));
+    let key = tmp.child("key");
+    let (sib, sib_bytes, sib_mode) = make_sibling(&tmp.path);
+    let parent_before = mode_of(&tmp.path);
+    let trace = tmp.child("trace.log");
+    fs::File::create(&trace).unwrap();
+    fs::set_permissions(&trace, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let Some(obs) = run_close_scenario(
+        sup,
+        bin,
+        "closefail-nounlink",
+        &key,
+        &trace,
+        &[
+            ("WRAPFILE_TEST_GETRANDOM_PARTIAL", "8"),
+            ("WRAPFILE_TEST_FAIL_CLOSE", "1"),
+            ("WRAPFILE_TEST_FAIL_UNLINK", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+    ) else {
+        return;
+    };
+    assert_eq!(
+        obs.rc, 0,
+        "[{profile}] observer must confirm the wipe, got FAIL: {:?}",
+        obs.fail.clone()
+    );
+
+    let pf = parse_pf_trace(&trace);
+    assert!(
+        pf_has(&pf, "CLOSE", Some("EIO")),
+        "the unrecoverable close EIO must have been injected"
+    );
+    assert!(
+        pf_has(&pf, "UNLINK", Some("EACCES")),
+        "the cleanup refusal must have been injected"
+    );
+
+    let secret = assert_full_key_delivered_saved_then_wiped(&obs, &trace, &pf, profile);
+
+    // The refused unlink never reaches unlinkat(2), so the observer sees no
+    // abort-unlink point: the wipe follows the close exit directly and must
+    // still precede the report.
+    assert!(obs.first("CLOSE_FAILED").is_none());
+    assert!(obs.index("ABORT_UNLINK").is_none());
+    assert_eq!(
+        obs.first("GUEST_EXIT").and_then(|e| e.i64("rc")),
+        Some(1)
+    );
+
+    // The residue really is the full, synced key in a 0600 file -- the
+    // warning is what keeps it from being mistaken for a saved key.
+    assert!(key.exists(), "the refused cleanup leaves this run's file at the target");
+    let on_disk = fs::read(&key).unwrap();
+    assert_eq!(on_disk.len(), KEY_LEN, "the residue holds the full 32 bytes");
+    assert_eq!(
+        on_disk, secret,
+        "the residue must be exactly the key bytes the failed save wrote"
+    );
+    assert_eq!(mode_of(&key), MODE_0600, "the residue still carries mode 0600");
+
+    let (out, err) = guest_captured(&key);
+    assert!(out.is_empty(), "no success message may be printed");
+    let err_text = String::from_utf8_lossy(&err);
+    assert!(
+        err_text.contains("closing the key file failed"),
+        "stderr must keep the close-stage failure reason: {err_text}"
+    );
+    assert!(
+        err_text.contains(&key.display().to_string()),
+        "stderr must name the target: {err_text}"
+    );
+    assert!(
+        err_text.contains("cleanup"),
+        "stderr must report the unfinished cleanup: {err_text}"
+    );
+    assert!(
+        err_text.contains("may still be present"),
+        "stderr must warn this run's file may remain at the target: {err_text}"
+    );
+    assert!(
+        !err.windows(KEY_LEN).any(|w| w == secret.as_slice()),
+        "the residue's key must not appear raw on stderr"
+    );
+    let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(!err_text.contains(&hex), "the residue's key must not appear hex-encoded");
+
+    // Nothing was stashed under another name and no other residue appeared
+    // (the observer's own stdout/stderr capture files share the scratch
+    // directory; they are harness artifacts, not product output).
+    let mut entries: Vec<String> = fs::read_dir(&tmp.path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "guest.stdout" && n != "guest.stderr")
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec!["key".to_string(), "sibling".to_string(), "trace.log".to_string()],
+        "no renamed copy or other leftover may appear"
+    );
+
+    assert_sentinel_untouched(&sib, &sib_bytes, sib_mode);
+    assert_eq!(mode_of(&tmp.path), parent_before, "parent mode must survive");
+}
+
+/// The Linux close-interruption boundary: close only reports EINTR and the
+/// descriptor is already released, so the save succeeds -- the original
+/// 32-byte key stays in a 0600 file and the save location is printed -- and
+/// the same temporary key is wiped before that success line.
+fn close_eintr_boundary_succeeds_and_wipes_before_report(
+    sup: &Support,
+    bin: &Path,
+    profile: &str,
+) {
+    let tmp = Tmp::new(&format!("close-eintr-{profile}"));
+    let key = tmp.child("key");
+    let (sib, sib_bytes, sib_mode) = make_sibling(&tmp.path);
+    let parent_before = mode_of(&tmp.path);
+    let trace = tmp.child("trace.log");
+    fs::File::create(&trace).unwrap();
+    fs::set_permissions(&trace, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let Some(obs) = run_close_scenario(
+        sup,
+        bin,
+        "close-eintr",
+        &key,
+        &trace,
+        &[
+            ("WRAPFILE_TEST_GETRANDOM_PARTIAL", "8"),
+            ("WRAPFILE_TEST_CLOSE_EINTR", "1"),
+            ("WRAPFILE_TEST_TRACE_BYTES", "1"),
+        ],
+    ) else {
+        return;
+    };
+    assert_eq!(
+        obs.rc, 0,
+        "[{profile}] observer must confirm the wipe, got FAIL: {:?}",
+        obs.fail.clone()
+    );
+
+    let pf = parse_pf_trace(&trace);
+    assert!(
+        pf_has(&pf, "CLOSE", Some("EINTR")),
+        "the recoverable close EINTR must have been injected"
+    );
+    assert!(
+        !pf_has(&pf, "UNLINK", None),
+        "an EINTR close is a completed save: nothing is unlinked"
+    );
+
+    let secret = assert_full_key_delivered_saved_then_wiped(&obs, &trace, &pf, profile);
+
+    // No failure/cleanup machinery: the wipe follows the close alone.
+    assert!(obs.first("CLOSE_FAILED").is_none());
+    assert!(obs.index("ABORT_UNLINK").is_none());
+    assert_eq!(
+        obs.first("GUEST_EXIT").and_then(|e| e.i64("rc")),
+        Some(0)
+    );
+
+    // Public success contract: exactly the delivered bytes, mode 0600,
+    // stdout only the save-location line, empty stderr.
+    let on_disk = fs::read(&key).expect("key file must exist on EINTR-close success");
+    assert_eq!(on_disk.len(), KEY_LEN);
+    assert_eq!(on_disk, secret, "the saved key must be the delivered bytes");
+    assert_eq!(mode_of(&key), MODE_0600, "key file mode must be exactly 0600");
+
+    let (out, err) = guest_captured(&key);
+    assert!(err.is_empty(), "stderr must be empty on success: {err:?}");
+    assert_eq!(
+        out,
+        format!("Key saved to {}\n", key.display()).into_bytes()
+    );
+
+    assert_sentinel_untouched(&sib, &sib_bytes, sib_mode);
+    assert_eq!(mode_of(&tmp.path), parent_before, "parent mode must survive");
+}
+
 
 // ---------------------------------------------------------------------------
 // tests: each scenario under both build profiles
@@ -796,5 +1270,41 @@ fn write_failure_after_full_key_zeroes_before_returning_under_both_profiles() {
     write_failure_after_full_key_still_wipes_the_full_key(&sup, &debug_bin(), "debug");
     if let Some(rel) = release_bin() {
         write_failure_after_full_key_still_wipes_the_full_key(&sup, &rel, "release");
+    }
+}
+
+#[test]
+fn close_error_after_full_key_zeroes_before_failure_report_under_both_profiles() {
+    let Some(sup) = support() else {
+        eprintln!("skipping: keylife/randtrap/permfail support unavailable");
+        return;
+    };
+    close_error_after_full_key_wipes_then_removes_file(&sup, &debug_bin(), "debug");
+    if let Some(rel) = release_bin() {
+        close_error_after_full_key_wipes_then_removes_file(&sup, &rel, "release");
+    }
+}
+
+#[test]
+fn close_error_with_unlink_refused_zeroes_with_residue_under_both_profiles() {
+    let Some(sup) = support() else {
+        eprintln!("skipping: keylife/randtrap/permfail support unavailable");
+        return;
+    };
+    close_error_with_unlink_refused_still_wipes_full_key(&sup, &debug_bin(), "debug");
+    if let Some(rel) = release_bin() {
+        close_error_with_unlink_refused_still_wipes_full_key(&sup, &rel, "release");
+    }
+}
+
+#[test]
+fn close_eintr_boundary_succeeds_and_zeroes_before_success_report_under_both_profiles() {
+    let Some(sup) = support() else {
+        eprintln!("skipping: keylife/randtrap/permfail support unavailable");
+        return;
+    };
+    close_eintr_boundary_succeeds_and_wipes_before_report(&sup, &debug_bin(), "debug");
+    if let Some(rel) = release_bin() {
+        close_eintr_boundary_succeeds_and_wipes_before_report(&sup, &rel, "release");
     }
 }
